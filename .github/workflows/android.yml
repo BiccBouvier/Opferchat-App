@@ -22,7 +22,7 @@ jobs:
           mkdir -p app/www app/assets
           cd app
           echo '{"name":"opferchat-app","version":"1.0.0","private":true}' > package.json
-          npm install --no-audit --no-fund @capacitor/core@7 @capacitor/cli@7 @capacitor/android@7 @capacitor/filesystem@7 @capacitor/share@7 @capacitor/assets@3
+          npm install --no-audit --no-fund @capacitor/core@7 @capacitor/cli@7 @capacitor/android@7 @capacitor/filesystem@7 @capacitor/share@7
           cat > capacitor.config.json <<'EOF'
           {"appId":"com.opferchat.app","appName":"Opferchat","webDir":"www",
            "server":{"url":"https://opferchat.com","androidScheme":"https","errorPath":"offline.html"},
@@ -35,10 +35,26 @@ jobs:
           <body><div><h2>Keine Verbindung</h2><p>Opferchat braucht Internet.<br>Prüf dein WLAN oder deine mobilen Daten.</p><button onclick="location.href='https://opferchat.com'">Nochmal versuchen</button></div></body></html>
           EOF
           cp www/offline.html www/index.html
-          cp ../icon.png assets/icon-only.png
           npx cap add android
-          npx capacitor-assets generate --android --iconBackgroundColor '#1d2340' --iconBackgroundColorDark '#1d2340' --splashBackgroundColor '#1d2340' --splashBackgroundColorDark '#1d2340' || echo "Icons: Standard bleibt"
           npx cap sync android
+      - name: App-Symbol und Startbild
+        run: |
+          command -v convert || (sudo apt-get update && sudo apt-get install -y imagemagick)
+          R=app/android/app/src/main/res
+          for d in mdpi:48:108 hdpi:72:162 xhdpi:96:216 xxhdpi:144:324 xxxhdpi:192:432; do
+            n=${d%%:*}; r=${d#*:}; l=${r%%:*}; f=${r#*:}
+            mkdir -p $R/mipmap-$n; rm -f $R/mipmap-$n/ic_launcher*.webp
+            convert icon.png -resize ${l}x${l} $R/mipmap-$n/ic_launcher.png
+            convert icon.png -resize ${l}x${l} $R/mipmap-$n/ic_launcher_round.png
+            convert icon.png -resize ${f}x${f} $R/mipmap-$n/ic_launcher_foreground.png
+          done
+          [ -f $R/values/ic_launcher_background.xml ] && sed -i 's/#[0-9A-Fa-f]\{6\}/#1d2340/' $R/values/ic_launcher_background.xml
+          for f in $(find $R -name 'splash.png'); do
+            W=$(identify -format '%w' $f); H=$(identify -format '%h' $f)
+            S=$(( (W<H?W:H)*40/100 ))
+            convert -size ${W}x${H} xc:'#1d2340' \( icon.png -resize ${S}x${S} \) -gravity center -composite $f
+          done
+          ls -la $R/mipmap-xxxhdpi
       - name: Rechte und Version eintragen
         run: |
           cd app/android
