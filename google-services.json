@@ -1,0 +1,40 @@
+{
+  "project_info": {
+    "project_number": "473520738265",
+    "firebase_url": "https://opferchat-default-rtdb.europe-west1.firebasedatabase.app",
+    "project_id": "opferchat",
+    "storage_bucket": "opferchat.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:473520738265:android:808611fe2e49c552ea93c8",
+        "android_client_info": {
+          "package_name": "com.opferchat.app"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "473520738265-n46nnbag9ljj9cqfeshl6dj3u5i5oepk.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBjoVq7_7TSdwL4Z00C-ukq8afN-1TIzZE"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "473520738265-n46nnbag9ljj9cqfeshl6dj3u5i5oepk.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
