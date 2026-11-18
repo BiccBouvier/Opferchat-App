@@ -21,6 +21,16 @@ jobs:
           [ -n "$CLOUDFLARE_API_TOKEN" ] || { echo "::error::Secret CLOUDFLARE_API_TOKEN fehlt"; exit 1; }
           [ -n "$CLOUDFLARE_ACCOUNT_ID" ] || { echo "::error::Secret CLOUDFLARE_ACCOUNT_ID fehlt"; exit 1; }
           node -e "const s=JSON.parse(process.env.SA);if(!s.private_key||!s.client_email)throw new Error('kein Dienstkonto');if(s.project_id!=='opferchat')throw new Error('falsches Projekt: '+s.project_id);console.log('Dienstkonto ok:',s.client_email)"
+      - name: Cloudflare prüfen
+        run: |
+          ID="$CLOUDFLARE_ACCOUNT_ID"
+          if echo "$ID" | grep -Eq '^[0-9a-f]{32}$'; then echo "Account ID hat das richtige Format"; else echo "::error::CLOUDFLARE_ACCOUNT_ID sieht falsch aus: Sie muss 32 Zeichen lang sein (Ziffern und a-f), sie ist ${#ID} Zeichen lang."; fi
+          chk(){ R=$(curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "https://api.cloudflare.com/client/v4/$1"); echo "$R" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const j=JSON.parse(d);const e=(j.errors||[]).map(x=>x.code+' '+x.message).join('; ');console.log('$2: '+(j.success?'OK':'NEIN')+(j.result&&j.result.status?' ('+j.result.status+')':'')+(j.result&&j.result.subdomain?' Subdomain: '+j.result.subdomain:'')+(e?' – '+e:''))}catch(x){console.log('$2: keine Antwort')}})"; }
+          chk "accounts/$ID/tokens/verify" "Token als Konto-Token"
+          chk "user/tokens/verify" "Token als Benutzer-Token"
+          chk "accounts/$ID" "Zugriff auf das Konto"
+          chk "accounts/$ID/workers/subdomain" "workers.dev-Subdomain"
+          chk "accounts/$ID/workers/scripts" "Workers lesen"
       - name: Server-Teil schreiben
         run: |
           mkdir push && cd push
@@ -167,8 +177,8 @@ jobs:
       - name: Zu Cloudflare hochladen
         run: |
           cd push
-          npx --yes wrangler@3 deploy 2>&1 | tee deploy.log
-          printf '%s' "$SA" | npx --yes wrangler@3 secret put SA
+          npx --yes wrangler@4 deploy 2>&1 | tee deploy.log
+          printf '%s' "$SA" | npx --yes wrangler@4 secret put SA
           URL=$(grep -o 'https://[a-zA-Z0-9.-]*workers\.dev' deploy.log | head -1)
           [ -n "$URL" ] || { echo "::error::Keine workers.dev-Adresse gefunden. Hast du in Cloudflare unter Workers & Pages eine Subdomain gewählt?"; exit 1; }
           echo "URL=$URL" >> $GITHUB_ENV
