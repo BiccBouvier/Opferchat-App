@@ -1,0 +1,190 @@
+name: Push-Server einrichten
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/push.yml']
+  workflow_dispatch:
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      SA: ${{ secrets.FIREBASE_SA }}
+      DB_URL: https://opferchat-default-rtdb.europe-west1.firebasedatabase.app
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Geheimnisse prüfen
+        run: |
+          [ -n "$CLOUDFLARE_API_TOKEN" ] || { echo "::error::Secret CLOUDFLARE_API_TOKEN fehlt"; exit 1; }
+          [ -n "$CLOUDFLARE_ACCOUNT_ID" ] || { echo "::error::Secret CLOUDFLARE_ACCOUNT_ID fehlt"; exit 1; }
+          node -e "const s=JSON.parse(process.env.SA);if(!s.private_key||!s.client_email)throw new Error('kein Dienstkonto');if(s.project_id!=='opferchat')throw new Error('falsches Projekt: '+s.project_id);console.log('Dienstkonto ok:',s.client_email)"
+      - name: Server-Teil schreiben
+        run: |
+          mkdir push && cd push
+          cat > wrangler.toml <<'EOF'
+          name = "opferchat-push"
+          main = "worker.js"
+          compatibility_date = "2024-11-01"
+          workers_dev = true
+          [vars]
+          DB_URL = "https://opferchat-default-rtdb.europe-west1.firebasedatabase.app"
+          PROJECT_ID = "opferchat"
+          EOF
+          cat > worker.js <<'EOF'
+          // Opferchat Push: verschickt Push-Benachrichtigungen an die Android-App (Firebase Cloud Messaging)
+          const enc = new TextEncoder(), dec = new TextDecoder();
+          let AT = null, ATX = 0, JW = null, JWX = 0;
+          const b64u = buf => { let s = ''; const u = new Uint8Array(buf); for (let i = 0; i < u.length; i++) s += String.fromCharCode(u[i]); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') };
+          const b64uStr = s => b64u(enc.encode(s));
+          const b64dec = s => { s = s.replace(/-/g, '+').replace(/_/g, '/'); while (s.length % 4) s += '='; const b = atob(s), u = new Uint8Array(b.length); for (let i = 0; i < b.length; i++) u[i] = b.charCodeAt(i); return u };
+
+          async function accessToken(env) {
+            const now = Math.floor(Date.now() / 1000);
+            if (AT && ATX > now + 120) return AT;
+            const sa = JSON.parse(env.SA);
+            const h = b64uStr(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
+            const c = b64uStr(JSON.stringify({ iss: sa.client_email, scope: 'https://www.googleapis.com/auth/firebase.database https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/firebase.messaging', aud: 'https://oauth2.googleapis.com/token', iat: now, exp: now + 3600 }));
+            const pem = sa.private_key.replace(/-----[^-]+-----/g, '').replace(/\s+/g, '');
+            const key = await crypto.subtle.importKey('pkcs8', b64dec(pem), { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['sign']);
+            const sig = await crypto.subtle.sign('RSASSA-PKCS1-v1_5', key, enc.encode(h + '.' + c));
+            const r = await fetch('https://oauth2.googleapis.com/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=' + h + '.' + c + '.' + b64u(sig) });
+            const j = await r.json();
+            if (!j.access_token) throw new Error('oauth ' + JSON.stringify(j).slice(0, 200));
+            AT = j.access_token; ATX = now + (j.expires_in || 3600); return AT;
+          }
+
+          async function verifyIdToken(t, pid) {
+            const parts = String(t || '').split('.');
+            if (parts.length !== 3) throw new Error('token');
+            const H = JSON.parse(dec.decode(b64dec(parts[0]))), P = JSON.parse(dec.decode(b64dec(parts[1])));
+            const now = Date.now() / 1000;
+            if (P.aud !== pid || P.iss !== 'https://securetoken.google.com/' + pid || !(P.exp > now) || !P.sub) throw new Error('claims');
+            if (!JW || JWX < Date.now()) { const r = await fetch('https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com'); JW = (await r.json()).keys || []; JWX = Date.now() + 3600e3 }
+            const jwk = JW.find(k => k.kid === H.kid);
+            if (!jwk) throw new Error('kid');
+            const key = await crypto.subtle.importKey('jwk', { kty: jwk.kty, n: jwk.n, e: jwk.e, alg: 'RS256', ext: true }, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
+            const ok = await crypto.subtle.verify('RSASSA-PKCS1-v1_5', key, b64dec(parts[2]), enc.encode(parts[0] + '.' + parts[1]));
+            if (!ok) throw new Error('sig');
+            return P.sub;
+          }
+
+          async function db(env, path, o = {}) {
+            const t = await accessToken(env);
+            const r = await fetch(env.DB_URL + '/' + path + '.json?access_token=' + t + (o.q ? '&' + o.q : ''), { method: o.m || 'GET', body: o.b !== undefined ? JSON.stringify(o.b) : undefined });
+            if (!r.ok) throw new Error('db ' + r.status + ' ' + path);
+            return r.json();
+          }
+
+          function preview(m) {
+            const t = String(m.t || '').replace(/\|\|[\s\S]+?\|\|/g, '•••');
+            let s = m.sp ? '🙈 Spoiler' : m.once ? '📷 Einmalbild' : m.img ? '📷 Foto' + (t ? ': ' + t : '') : m.vid ? '🎬 Video' : m.aud ? '🎤 Sprachnachricht' : m.gif ? 'GIF' :
+              m.file ? '📎 ' + (m.file.n || 'Datei') : m.loc ? '📍 Standort' : (m.stk || m.stc) ? 'Sticker' : m.po ? '📊 Umfrage: ' + t : m.gm ? '🎮 Spiel' : t;
+            s = s || 'Neue Nachricht';
+            return s.length > 180 ? s.slice(0, 177) + '…' : s;
+          }
+
+          async function send(env, rec, gid, sender, o, budget) {
+            if (!rec.length) return 0;
+            if (!budget.all) budget.all = (await db(env, 'push')) || {};
+            const all = budget.all;
+            if (sender && !budget.blk) budget.blk = (await db(env, 'blockedby/' + sender)) || {};
+            const blk = sender ? budget.blk : {};
+            rec = rec.filter(u => all[u] && !blk[u]);
+            const t = await accessToken(env);
+            let n = 0;
+            for (const u of rec) {
+              if (budget.left < 2) break;
+              budget.left--;
+              let mu = null; try { mu = await db(env, 'me/' + u + '/mu/' + gid) } catch (e) { }
+              if (mu) continue;
+              for (const [k, v] of Object.entries(all[u] || {})) {
+                if (!v || !v.t || budget.left < 1) continue;
+                budget.left--;
+                const msg = { message: { token: v.t, notification: { title: o.title, body: o.body }, data: { gid, type: o.type },
+                  android: { priority: 'HIGH', ttl: o.ttl || '86400s', notification: { channel_id: o.channel, tag: o.type === 'call' ? 'call_' + gid : gid, icon: 'ic_stat_notify', color: '#ffe14d', sound: 'default' } } } };
+                const r = await fetch('https://fcm.googleapis.com/v1/projects/' + env.PROJECT_ID + '/messages:send', { method: 'POST', headers: { Authorization: 'Bearer ' + t, 'Content-Type': 'application/json' }, body: JSON.stringify(msg) });
+                if (r.ok) n++;
+                else { const e = await r.text(); if ((r.status === 404 || /UNREGISTERED/.test(e)) && budget.left > 0) { budget.left--; try { await db(env, 'push/' + u + '/' + k, { m: 'DELETE' }) } catch (x) { } } else console.log('fcm', r.status, e.slice(0, 200)) }
+              }
+            }
+            return n;
+          }
+
+          async function notify(env, uid, body) {
+            const budget = { left: 30 };
+            const gid = String(body.gid || '');
+            if (!/^[A-Za-z0-9_-]{1,120}$/.test(gid)) return { e: 'gid' };
+            const pub = gid === 'allgemein';
+            const g = pub ? {} : await db(env, 'groups/' + gid);
+            if (!pub && !g) return { e: 'nogroup' };
+            const members = pub ? [] : Object.keys(g.dm || g.members || {});
+            if (!pub && !members.includes(uid)) return { e: 'member' };
+            const NM = {}; const name = async u => { if (NM[u]) return NM[u]; try { NM[u] = (await db(env, 'users/' + u + '/name')) || 'Jemand' } catch (e) { NM[u] = 'Jemand' } return NM[u] };
+            if (body.call) {
+              if (pub) return { e: 'pub' };
+              const info = await db(env, 'calls/' + gid + '/info');
+              if (!info || info.by !== uid || Date.now() - (info.ts || 0) > 90000) return { e: 'nocall' };
+              const who = await name(uid);
+              const title = (info.v ? '📹 ' : '📞 ') + who + (g.dm ? ' ruft dich an' : ' ruft in ' + (g.name || 'der Gruppe') + ' an');
+              return { n: await send(env, members.filter(u => u !== uid), gid, uid, { title, body: info.v ? 'Videoanruf · Tippen zum Annehmen' : 'Sprachanruf · Tippen zum Annehmen', channel: 'calls', type: 'call', ttl: '45s' }, budget) };
+            }
+            const ms = (await db(env, 'chatmsgs/' + gid, { q: 'orderBy=%22%24key%22&limitToLast=4' })) || {};
+            const done = (await db(env, 'pushd/' + gid, { q: 'orderBy=%22%24key%22&limitToLast=12' })) || {};
+            let n = 0;
+            for (const [mid, m] of Object.entries(ms)) {
+              if (!m || m.del || done[mid] || Date.now() - (m.ts || 0) > 600000) continue;
+              if (m.uid !== uid && !(pub && m.uid === 'anon')) continue;
+              await db(env, 'pushd/' + gid + '/' + mid, { m: 'PUT', b: 1 });
+              let rec = pub ? Object.keys(m.mn || {}) : members;
+              rec = rec.filter(u => u !== uid);
+              if (!rec.length) continue;
+              const who = m.uid === 'anon' ? (m.an || 'Anonym') : await name(uid);
+              const txt = preview(m);
+              const title = g.dm ? who : pub ? who + ' im Public Chat' : (g.name || 'Gruppe');
+              n += await send(env, rec, gid, m.uid === 'anon' ? null : uid, { title, body: (g.dm || pub) ? txt : who + ': ' + txt, channel: 'msgs', type: 'msg' }, budget);
+            }
+            return { n };
+          }
+
+          const CORS = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type, Authorization' };
+          export default {
+            async fetch(req, env) {
+              if (req.method === 'OPTIONS') return new Response(null, { headers: CORS });
+              const url = new URL(req.url);
+              if (req.method === 'GET') return new Response('Opferchat Push läuft', { headers: CORS });
+              if (url.pathname !== '/notify' || req.method !== 'POST') return new Response('nicht gefunden', { status: 404, headers: CORS });
+              let uid;
+              try { uid = await verifyIdToken((req.headers.get('Authorization') || '').replace(/^Bearer /, ''), env.PROJECT_ID) } catch (e) { return new Response('nicht angemeldet', { status: 401, headers: CORS }) }
+              try { const body = await req.json(); const r = await notify(env, uid, body); return new Response(JSON.stringify(r), { headers: { ...CORS, 'Content-Type': 'application/json' } }) }
+              catch (e) { console.log('Fehler', String(e)); return new Response('Fehler', { status: 500, headers: CORS }) }
+            }
+          };
+
+          EOF
+      - name: Zu Cloudflare hochladen
+        run: |
+          cd push
+          npx --yes wrangler@3 deploy 2>&1 | tee deploy.log
+          printf '%s' "$SA" | npx --yes wrangler@3 secret put SA
+          URL=$(grep -o 'https://[a-zA-Z0-9.-]*workers\.dev' deploy.log | head -1)
+          [ -n "$URL" ] || { echo "::error::Keine workers.dev-Adresse gefunden. Hast du in Cloudflare unter Workers & Pages eine Subdomain gewählt?"; exit 1; }
+          echo "URL=$URL" >> $GITHUB_ENV
+          echo "Push-Server: $URL"
+      - name: Adresse in Firebase eintragen
+        run: |
+          node -e "$CFG" "$URL"
+        env:
+          CFG: |
+            const sa=JSON.parse(process.env.SA),url=process.argv[1],c=require('crypto');
+            const b=o=>Buffer.from(JSON.stringify(o)).toString('base64url'),now=Math.floor(Date.now()/1000);
+            const h=b({alg:'RS256',typ:'JWT'}),p=b({iss:sa.client_email,scope:'https://www.googleapis.com/auth/firebase.database https://www.googleapis.com/auth/userinfo.email',aud:'https://oauth2.googleapis.com/token',iat:now,exp:now+600});
+            const s=c.createSign('RSA-SHA256').update(h+'.'+p).sign(sa.private_key).toString('base64url');
+            (async()=>{const r=await fetch('https://oauth2.googleapis.com/token',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion='+h+'.'+p+'.'+s});const j=await r.json();if(!j.access_token){console.log(j);process.exit(1)}
+            const q=await fetch(process.env.DB_URL+'/pushcfg/url.json?access_token='+j.access_token,{method:'PUT',body:JSON.stringify(url)});console.log('pushcfg/url',q.status,await q.text());if(!q.ok)process.exit(1)})();
+      - name: Testen
+        run: |
+          sleep 5
+          curl -s "$URL" ; echo
