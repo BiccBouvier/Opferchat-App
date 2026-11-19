@@ -184,10 +184,25 @@ jobs:
       - name: Zu Cloudflare hochladen
         run: |
           cd push
-          npx --yes wrangler@4 deploy 2>&1 | tee deploy.log
+          ID="$CLOUDFLARE_ACCOUNT_ID";API="https://api.cloudflare.com/client/v4/accounts/$ID/workers"
+          npx --yes wrangler@4 deploy 2>&1 | tee deploy.log || true
+          URL=$(grep -o 'https://[a-zA-Z0-9.-]*workers\.dev' deploy.log | head -1 || true)
+          if [ -z "$URL" ]; then
+            echo "Keine Adresse im Log, warte kurz und schalte workers.dev selbst ein"
+            SUB=$(curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "$API/subdomain" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{process.stdout.write(JSON.parse(d).result.subdomain||'')}catch(e){}})")
+            [ -n "$SUB" ] || { echo "::error::Keine workers.dev-Subdomain. Lege in Cloudflare unter Workers & Pages einmal eine Subdomain fest."; exit 1; }
+            OK=0
+            for i in 1 2 3 4 5 6 7 8; do
+              sleep 10
+              R=$(curl -s -X POST -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" -H "Content-Type: application/json" --data '{"enabled":true,"previews_enabled":true}' "$API/scripts/opferchat-push/subdomain")
+              echo "Versuch $i: $(echo "$R" | head -c 200)"
+              if echo "$R" | grep -q '"success":true'; then OK=1; break; fi
+            done
+            [ "$OK" = 1 ] || { echo "::error::workers.dev konnte nicht eingeschaltet werden"; exit 1; }
+            URL="https://opferchat-push.$SUB.workers.dev"
+          fi
           printf '%s' "$SA" | npx --yes wrangler@4 secret put SA
-          URL=$(grep -o 'https://[a-zA-Z0-9.-]*workers\.dev' deploy.log | head -1)
-          [ -n "$URL" ] || { echo "::error::Keine workers.dev-Adresse gefunden. Hast du in Cloudflare unter Workers & Pages eine Subdomain gewählt?"; exit 1; }
+          for i in $(seq 1 12); do T=$(curl -s --max-time 10 "$URL" || true); if echo "$T" | grep -q "Opferchat Push"; then echo "Push-Server antwortet"; break; fi; echo "warte auf $URL ($i)"; sleep 10; done
           echo "URL=$URL" >> $GITHUB_ENV
           echo "Push-Server: $URL"
       - name: Adresse in Firebase eintragen
