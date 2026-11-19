@@ -125,6 +125,14 @@ jobs:
 
           async function notify(env, uid, body) {
             const budget = { left: 30 };
+            if (body.test) {
+              const mine = (await db(env, 'push/' + uid)) || {};
+              const dev = Object.keys(mine).length;
+              if (!dev) return { n: 0, dev: 0 };
+              budget.all = { [uid]: mine };
+              const n = await send(env, [uid], 'test', null, { title: 'Opferchat', body: 'Test: Push-Benachrichtigungen funktionieren.', channel: 'msgs', type: 'test', ttl: '300s' }, budget);
+              return { n, dev, e: n ? null : 'FCM' };
+            }
             const gid = String(body.gid || '');
             if (!/^[A-Za-z0-9_-]{1,120}$/.test(gid)) return { e: 'gid' };
             const pub = gid === 'allgemein';
@@ -172,7 +180,6 @@ jobs:
               catch (e) { console.log('Fehler', String(e)); return new Response('Fehler', { status: 500, headers: CORS }) }
             }
           };
-
           EOF
       - name: Zu Cloudflare hochladen
         run: |
