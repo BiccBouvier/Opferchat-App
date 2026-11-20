@@ -22,7 +22,7 @@ jobs:
           mkdir -p app/www app/assets
           cd app
           echo '{"name":"opferchat-app","version":"1.0.0","private":true}' > package.json
-          npm install --no-audit --no-fund @capacitor/core@7 @capacitor/cli@7 @capacitor/android@7 @capacitor/filesystem@7 @capacitor/share@7 @capacitor/push-notifications@7
+          npm install --no-audit --no-fund @capacitor/core@7 @capacitor/cli@7 @capacitor/android@7 @capacitor/filesystem@7 @capacitor/share@7 @capacitor/push-notifications@7 @capacitor/app@7
           cat > capacitor.config.json <<'EOF'
           {"appId":"com.opferchat.app","appName":"Opferchat","webDir":"www",
            "server":{"url":"https://opferchat.com","androidScheme":"https","errorPath":"offline.html"},
