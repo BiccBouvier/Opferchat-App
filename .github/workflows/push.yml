@@ -11,6 +11,8 @@ jobs:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       SA: ${{ secrets.FIREBASE_SA }}
+      TURN_KEY_ID: ${{ secrets.TURN_KEY_ID }}
+      TURN_KEY_TOKEN: ${{ secrets.TURN_KEY_TOKEN }}
       DB_URL: https://opferchat-default-rtdb.europe-west1.firebasedatabase.app
     steps:
       - uses: actions/setup-node@v4
@@ -44,7 +46,7 @@ jobs:
           PROJECT_ID = "opferchat"
           EOF
           cat > worker.js <<'EOF'
-          // Opferchat Push: verschickt Push-Benachrichtigungen an die Android-App (Firebase Cloud Messaging)
+          // Opferchat Push: verschickt Push-Benachrichtigungen an die Android-App (Firebase Cloud Messaging), setzt Passwörter neu und liefert TURN-Zugangsdaten für Anrufe
           const enc = new TextEncoder(), dec = new TextDecoder();
           let AT = null, ATX = 0, JW = null, JWX = 0;
           const b64u = buf => { let s = ''; const u = new Uint8Array(buf); for (let i = 0; i < u.length; i++) s += String.fromCharCode(u[i]); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') };
@@ -56,7 +58,7 @@ jobs:
             if (AT && ATX > now + 120) return AT;
             const sa = JSON.parse(env.SA);
             const h = b64uStr(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
-            const c = b64uStr(JSON.stringify({ iss: sa.client_email, scope: 'https://www.googleapis.com/auth/firebase.database https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/firebase.messaging', aud: 'https://oauth2.googleapis.com/token', iat: now, exp: now + 3600 }));
+            const c = b64uStr(JSON.stringify({ iss: sa.client_email, scope: 'https://www.googleapis.com/auth/firebase.database https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/firebase.messaging https://www.googleapis.com/auth/identitytoolkit https://www.googleapis.com/auth/cloud-platform', aud: 'https://oauth2.googleapis.com/token', iat: now, exp: now + 3600 }));
             const pem = sa.private_key.replace(/-----[^-]+-----/g, '').replace(/\s+/g, '');
             const key = await crypto.subtle.importKey('pkcs8', b64dec(pem), { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['sign']);
             const sig = await crypto.subtle.sign('RSASSA-PKCS1-v1_5', key, enc.encode(h + '.' + c));
@@ -133,6 +135,17 @@ jobs:
               const n = await send(env, [uid], 'test', null, { title: 'Opferchat', body: 'Test: Push-Benachrichtigungen funktionieren.', channel: 'msgs', type: 'test', ttl: '300s' }, budget);
               return { n, dev, e: n ? null : 'FCM' };
             }
+            if (body.rq) {
+              const rid = String(body.rq || '');
+              if (!/^[A-Za-z0-9]{6,64}$/.test(rid) || rid === uid) return { e: 'rq' };
+              const r = await db(env, 'rq/' + rid + '/' + uid);
+              if (!r || r.s !== 0 || Date.now() - (r.ts || 0) > 600000) return { e: 'norq' };
+              const done = await db(env, 'pushd/rq_' + rid + '/' + uid);
+              if (done && done === r.ts) return { n: 0 };
+              await db(env, 'pushd/rq_' + rid + '/' + uid, { m: 'PUT', b: r.ts });
+              const who = (await db(env, 'users/' + uid + '/name')) || 'Jemand';
+              return { n: await send(env, [rid], 'rq', uid, { title: 'Nachrichtenanfrage', body: who + ' möchte dir schreiben', channel: 'msgs', type: 'rq' }, budget) };
+            }
             const gid = String(body.gid || '');
             if (!/^[A-Za-z0-9_-]{1,120}$/.test(gid)) return { e: 'gid' };
             const pub = gid === 'allgemein';
@@ -167,16 +180,37 @@ jobs:
             return { n };
           }
 
+          async function setPw(env, uid, body) {
+            const pw = String(body.pw || '');
+            if (pw.length < 6 || pw.length > 128) return { e: 'pw' };
+            const t = await accessToken(env);
+            const r = await fetch('https://identitytoolkit.googleapis.com/v1/projects/' + env.PROJECT_ID + '/accounts:update', { method: 'POST', headers: { Authorization: 'Bearer ' + t, 'Content-Type': 'application/json' }, body: JSON.stringify({ localId: uid, password: pw }) });
+            if (!r.ok) { console.log('pw', r.status, (await r.text()).slice(0, 200)); return { e: 'auth' } }
+            return { ok: 1 };
+          }
+
+          let TC = null, TCX = 0;
+          async function turn(env) {
+            if (!env.TURN_KEY_ID || !env.TURN_KEY_TOKEN) return { iceServers: [] };
+            if (TC && TCX > Date.now()) return TC;
+            const r = await fetch('https://rtc.live.cloudflare.com/v1/turn/keys/' + env.TURN_KEY_ID + '/credentials/generate-ice-servers', { method: 'POST', headers: { Authorization: 'Bearer ' + env.TURN_KEY_TOKEN, 'Content-Type': 'application/json' }, body: JSON.stringify({ ttl: 86400 }) });
+            if (!r.ok) { console.log('turn', r.status, (await r.text()).slice(0, 200)); return { iceServers: [] } }
+            const j = await r.json();
+            TC = { iceServers: (j.iceServers || []).map(s => ({ ...s, urls: [].concat(s.urls || []).filter(u => !/:53(\?|$)/.test(u)) })).filter(s => s.urls.length) };
+            TCX = Date.now() + 6 * 3600e3;
+            return TC;
+          }
+
           const CORS = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type, Authorization' };
           export default {
             async fetch(req, env) {
               if (req.method === 'OPTIONS') return new Response(null, { headers: CORS });
               const url = new URL(req.url);
               if (req.method === 'GET') return new Response('Opferchat Push läuft', { headers: CORS });
-              if (url.pathname !== '/notify' || req.method !== 'POST') return new Response('nicht gefunden', { status: 404, headers: CORS });
+              if (!['/notify', '/pw', '/turn'].includes(url.pathname) || req.method !== 'POST') return new Response('nicht gefunden', { status: 404, headers: CORS });
               let uid;
               try { uid = await verifyIdToken((req.headers.get('Authorization') || '').replace(/^Bearer /, ''), env.PROJECT_ID) } catch (e) { return new Response('nicht angemeldet', { status: 401, headers: CORS }) }
-              try { const body = await req.json(); const r = await notify(env, uid, body); return new Response(JSON.stringify(r), { headers: { ...CORS, 'Content-Type': 'application/json' } }) }
+              try { const body = await req.json().catch(() => ({})); const r = url.pathname === '/pw' ? await setPw(env, uid, body) : url.pathname === '/turn' ? await turn(env) : await notify(env, uid, body); return new Response(JSON.stringify(r), { headers: { ...CORS, 'Content-Type': 'application/json' } }) }
               catch (e) { console.log('Fehler', String(e)); return new Response('Fehler', { status: 500, headers: CORS }) }
             }
           };
@@ -202,6 +236,13 @@ jobs:
             URL="https://opferchat-push.$SUB.workers.dev"
           fi
           printf '%s' "$SA" | npx --yes wrangler@4 secret put SA
+          if [ -n "$TURN_KEY_ID" ] && [ -n "$TURN_KEY_TOKEN" ]; then
+            printf '%s' "$TURN_KEY_ID" | npx --yes wrangler@4 secret put TURN_KEY_ID
+            printf '%s' "$TURN_KEY_TOKEN" | npx --yes wrangler@4 secret put TURN_KEY_TOKEN
+            echo "TURN-Server für Anrufe eingerichtet"
+          else
+            echo "Kein TURN-Schlüssel hinterlegt (TURN_KEY_ID, TURN_KEY_TOKEN). Anrufe laufen ohne eigenen TURN-Server."
+          fi
           for i in $(seq 1 12); do T=$(curl -s --max-time 10 "$URL" || true); if echo "$T" | grep -q "Opferchat Push"; then echo "Push-Server antwortet"; break; fi; echo "warte auf $URL ($i)"; sleep 10; done
           echo "URL=$URL" >> $GITHUB_ENV
           echo "Push-Server: $URL"
