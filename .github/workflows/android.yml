@@ -17,18 +17,30 @@ jobs:
         with:
           distribution: temurin
           java-version: 21
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Projekt anlegen
         run: |
           mkdir -p app/www app/assets
           cd app
           echo '{"name":"opferchat-app","version":"1.0.0","private":true}' > package.json
           npm install --no-audit --no-fund @capacitor/core@7 @capacitor/cli@7 @capacitor/android@7 @capacitor/filesystem@7 @capacitor/share@7 @capacitor/push-notifications@7 @capacitor/app@7 @capacitor/haptics@7
+          # Zusatzfunktionen fuer spaeter. Was sich nicht einbauen laesst, wird einfach uebersprungen.
+          : > opt_official_ok.txt; : > opt_community_ok.txt
+          for n in @capacitor/camera @capacitor/clipboard @capacitor/device @capacitor/geolocation @capacitor/local-notifications @capacitor/network @capacitor/preferences @capacitor/screen-orientation @capacitor/browser @capacitor/motion; do
+            if npm install --no-audit --no-fund $n@7 >/dev/null 2>&1; then echo $n >> opt_official_ok.txt; else echo "::warning::$n ließ sich nicht einbauen"; fi
+          done
+          for n in @capacitor-community/keep-awake @capacitor-community/speech-recognition @capacitor-community/text-to-speech @capacitor-community/media @capacitor-mlkit/barcode-scanning @capawesome/capacitor-badge @capawesome/capacitor-file-picker @capgo/capacitor-native-biometric; do
+            if npm install --no-audit --no-fund $n@7 >/dev/null 2>&1; then echo $n >> opt_community_ok.txt; else echo "::warning::$n ließ sich nicht einbauen"; fi
+          done
+          echo "Eingebaut (offiziell):"; cat opt_official_ok.txt; echo "Eingebaut (Community):"; cat opt_community_ok.txt
           cat > capacitor.config.json <<'EOF'
           {"appId":"com.opferchat.app","appName":"Opferchat","webDir":"www",
            "server":{"url":"https://opferchat.com","androidScheme":"https","errorPath":"offline.html"},
            "appendUserAgent":"OpferchatApp/1","backgroundColor":"#1d2340",
            "android":{"allowMixedContent":false},
-           "plugins":{"PushNotifications":{"presentationOptions":["badge","sound","alert"]}}}
+           "plugins":{"PushNotifications":{"presentationOptions":["badge","sound","alert"]},"LocalNotifications":{"smallIcon":"ic_stat_notify","iconColor":"#FFE14D"}}}
           EOF
           cat > www/offline.html <<'EOF'
           <!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -39,6 +51,771 @@ jobs:
           npx cap add android
           if [ -f ../google-services.json ]; then cp ../google-services.json android/app/google-services.json; echo "google-services.json eingebaut"; else echo "::warning::google-services.json fehlt, Push geht noch nicht"; fi
           npx cap sync android
+      - name: Eigene Android-Teile, Klingeltöne und Build-Einstellungen
+        run: |
+          cd app
+          P=android/app/src/main/java/com/opferchat/app
+          mkdir -p $P
+          cp $P/MainActivity.java MainActivity.java.orig
+          cat > $P/CallService.java <<'EOF'
+          package com.opferchat.app;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Service;
+          import android.content.Intent;
+          import android.content.pm.ServiceInfo;
+          import android.os.Build;
+          import android.os.IBinder;
+          import android.os.PowerManager;
+
+          /* Haelt waehrend eines Anrufs das Mikrofon (und die Verbindung) am Leben, auch wenn die App nicht vorne ist. */
+          public class CallService extends Service {
+              static final String CHANNEL = "oc_call_running";
+              static final int NOTE_ID = 7101;
+              private PowerManager.WakeLock wl;
+
+              @Override
+              public IBinder onBind(Intent intent) {
+                  return null;
+              }
+
+              @Override
+              public int onStartCommand(Intent intent, int flags, int startId) {
+                  String title = intent != null ? intent.getStringExtra("title") : null;
+                  String text = intent != null ? intent.getStringExtra("text") : null;
+                  boolean video = intent != null && intent.getBooleanExtra("video", false);
+                  if (title == null) title = "Opferchat";
+                  if (text == null) text = "Anruf läuft";
+                  try {
+                      NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+                      if (Build.VERSION.SDK_INT >= 26 && nm != null) {
+                          NotificationChannel ch = new NotificationChannel(CHANNEL, "Laufender Anruf", NotificationManager.IMPORTANCE_LOW);
+                          ch.setShowBadge(false);
+                          nm.createNotificationChannel(ch);
+                      }
+                      Intent open = new Intent(this, MainActivity.class);
+                      open.addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                      int pf = PendingIntent.FLAG_UPDATE_CURRENT;
+                      if (Build.VERSION.SDK_INT >= 23) pf |= PendingIntent.FLAG_IMMUTABLE;
+                      PendingIntent pi = PendingIntent.getActivity(this, 0, open, pf);
+                      Notification.Builder b = Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(this, CHANNEL) : new Notification.Builder(this);
+                      int icon = getResources().getIdentifier("ic_stat_notify", "drawable", getPackageName());
+                      b.setSmallIcon(icon != 0 ? icon : getApplicationInfo().icon);
+                      b.setContentTitle(title);
+                      b.setContentText(text);
+                      b.setContentIntent(pi);
+                      b.setOngoing(true);
+                      b.setOnlyAlertOnce(true);
+                      if (Build.VERSION.SDK_INT >= 21) b.setCategory(Notification.CATEGORY_CALL);
+                      Notification n = b.build();
+                      boolean ok = false;
+                      if (Build.VERSION.SDK_INT >= 30) {
+                          try {
+                              int type = ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE;
+                              if (video) type |= ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA;
+                              startForeground(NOTE_ID, n, type);
+                              ok = true;
+                          } catch (Exception e1) {
+                              try {
+                                  startForeground(NOTE_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE);
+                                  ok = true;
+                              } catch (Exception e2) {
+                                  ok = false;
+                              }
+                          }
+                      } else {
+                          startForeground(NOTE_ID, n);
+                          ok = true;
+                      }
+                      if (!ok) {
+                          stopSelf();
+                          return START_NOT_STICKY;
+                      }
+                      PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+                      if (pm != null && (wl == null || !wl.isHeld())) {
+                          wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Opferchat:call");
+                          wl.setReferenceCounted(false);
+                          wl.acquire(4 * 60 * 60 * 1000L);
+                      }
+                  } catch (Exception e) {
+                      stopSelf();
+                  }
+                  return START_NOT_STICKY;
+              }
+
+              private void release() {
+                  try {
+                      if (wl != null && wl.isHeld()) wl.release();
+                  } catch (Exception e) {
+                      /* egal */
+                  }
+                  wl = null;
+              }
+
+              @Override
+              public void onTaskRemoved(Intent rootIntent) {
+                  release();
+                  stopSelf();
+              }
+
+              @Override
+              public void onDestroy() {
+                  release();
+                  super.onDestroy();
+              }
+          }
+          EOF
+          cat > $P/OcNativePlugin.java <<'EOF'
+          package com.opferchat.app;
+
+          import android.content.ContentResolver;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.media.AudioManager;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.PowerManager;
+          import android.provider.Settings;
+          import android.util.Base64;
+
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+
+          import java.io.ByteArrayOutputStream;
+          import java.io.InputStream;
+
+          /* Eigene Android-Funktionen fuer Opferchat. Die Webseite ruft sie ueber Capacitor.Plugins.OcNative auf. */
+          @CapacitorPlugin(name = "OcNative")
+          public class OcNativePlugin extends Plugin {
+              static final int VERSION = 2;
+              static volatile boolean callActive = false;
+              static volatile JSObject pendingShare = null;
+              private PowerManager.WakeLock prox;
+
+              /* Wird von MainActivity aufgerufen: Text oder Bild, das in Opferchat geteilt wurde. */
+              static void handleIntent(Intent in) {
+                  try {
+                      if (in == null) return;
+                      if (!Intent.ACTION_SEND.equals(in.getAction())) return;
+                      String type = in.getType();
+                      if (type == null) return;
+                      JSObject o = new JSObject();
+                      if (type.startsWith("text/")) {
+                          CharSequence cs = in.getCharSequenceExtra(Intent.EXTRA_TEXT);
+                          if (cs == null || cs.length() == 0) return;
+                          o.put("kind", "text");
+                          o.put("text", cs.toString());
+                      } else if (type.startsWith("image/")) {
+                          Uri u = getStream(in);
+                          if (u == null) return;
+                          o.put("kind", "image");
+                          o.put("uri", u.toString());
+                          o.put("mime", type);
+                      } else {
+                          return;
+                      }
+                      pendingShare = o;
+                      in.setAction(null);
+                  } catch (Exception e) {
+                      /* egal */
+                  }
+              }
+
+              @SuppressWarnings("deprecation")
+              private static Uri getStream(Intent in) {
+                  if (Build.VERSION.SDK_INT >= 33) return in.getParcelableExtra(Intent.EXTRA_STREAM, Uri.class);
+                  return (Uri) in.getParcelableExtra(Intent.EXTRA_STREAM);
+              }
+
+              @PluginMethod
+              public void info(PluginCall call) {
+                  JSObject o = new JSObject();
+                  o.put("v", VERSION);
+                  o.put("sdk", Build.VERSION.SDK_INT);
+                  call.resolve(o);
+              }
+
+              @PluginMethod
+              public void callStart(PluginCall call) {
+                  try {
+                      Context c = getContext();
+                      Intent i = new Intent(c, CallService.class);
+                      i.putExtra("title", call.getString("title", "Opferchat"));
+                      i.putExtra("text", call.getString("text", "Anruf läuft"));
+                      i.putExtra("video", Boolean.TRUE.equals(call.getBoolean("video", false)));
+                      if (Build.VERSION.SDK_INT >= 26) c.startForegroundService(i);
+                      else c.startService(i);
+                      callActive = true;
+                      call.resolve();
+                  } catch (Exception e) {
+                      call.reject(String.valueOf(e.getMessage()));
+                  }
+              }
+
+              @PluginMethod
+              public void callStop(PluginCall call) {
+                  callActive = false;
+                  try {
+                      Context c = getContext();
+                      c.stopService(new Intent(c, CallService.class));
+                  } catch (Exception e) {
+                      /* egal */
+                  }
+                  call.resolve();
+              }
+
+              /* Anruf-Audio: call=true schaltet den Telefon-Modus ein, speaker=true den Lautsprecher. */
+              @SuppressWarnings("deprecation")
+              @PluginMethod
+              public void setAudio(PluginCall call) {
+                  try {
+                      AudioManager am = (AudioManager) getContext().getSystemService(Context.AUDIO_SERVICE);
+                      if (am == null) {
+                          call.reject("kein AudioManager");
+                          return;
+                      }
+                      boolean on = Boolean.TRUE.equals(call.getBoolean("call", true));
+                      boolean sp = Boolean.TRUE.equals(call.getBoolean("speaker", false));
+                      am.setMode(on ? AudioManager.MODE_IN_COMMUNICATION : AudioManager.MODE_NORMAL);
+                      am.setSpeakerphoneOn(on && sp);
+                      call.resolve();
+                  } catch (Exception e) {
+                      call.reject(String.valueOf(e.getMessage()));
+                  }
+              }
+
+              /* Bildschirm aus, wenn das Handy ans Ohr gehalten wird. */
+              @PluginMethod
+              public void proximity(PluginCall call) {
+                  try {
+                      boolean on = Boolean.TRUE.equals(call.getBoolean("on", false));
+                      PowerManager pm = (PowerManager) getContext().getSystemService(Context.POWER_SERVICE);
+                      if (on) {
+                          if (pm != null && pm.isWakeLockLevelSupported(PowerManager.PROXIMITY_SCREEN_OFF_WAKE_LOCK)) {
+                              if (prox == null) {
+                                  prox = pm.newWakeLock(PowerManager.PROXIMITY_SCREEN_OFF_WAKE_LOCK, "Opferchat:prox");
+                                  prox.setReferenceCounted(false);
+                              }
+                              if (!prox.isHeld()) prox.acquire(4 * 60 * 60 * 1000L);
+                          }
+                      } else if (prox != null && prox.isHeld()) {
+                          prox.release();
+                      }
+                      call.resolve();
+                  } catch (Exception e) {
+                      call.reject(String.valueOf(e.getMessage()));
+                  }
+              }
+
+              /* Geteilter Inhalt, der noch nicht abgeholt wurde. Wird beim Abholen geloescht. */
+              @PluginMethod
+              public void getShared(PluginCall call) {
+                  JSObject o = pendingShare;
+                  pendingShare = null;
+                  call.resolve(o != null ? o : new JSObject());
+              }
+
+              /* Liest eine geteilte Datei (content://) und gibt sie als Base64 zurueck. */
+              @PluginMethod
+              public void readUri(PluginCall call) {
+                  String uri = call.getString("uri");
+                  int max = call.getInt("max", 8 * 1024 * 1024);
+                  if (uri == null) {
+                      call.reject("uri fehlt");
+                      return;
+                  }
+                  InputStream in = null;
+                  try {
+                      ContentResolver cr = getContext().getContentResolver();
+                      Uri u = Uri.parse(uri);
+                      in = cr.openInputStream(u);
+                      if (in == null) {
+                          call.reject("nicht lesbar");
+                          return;
+                      }
+                      ByteArrayOutputStream bo = new ByteArrayOutputStream();
+                      byte[] buf = new byte[16384];
+                      int n;
+                      while ((n = in.read(buf)) > 0) {
+                          bo.write(buf, 0, n);
+                          if (bo.size() > max) {
+                              call.reject("zu gross");
+                              return;
+                          }
+                      }
+                      JSObject o = new JSObject();
+                      o.put("data", Base64.encodeToString(bo.toByteArray(), Base64.NO_WRAP));
+                      String mime = cr.getType(u);
+                      o.put("mime", mime != null ? mime : "application/octet-stream");
+                      call.resolve(o);
+                  } catch (Exception e) {
+                      call.reject(String.valueOf(e.getMessage()));
+                  } finally {
+                      try {
+                          if (in != null) in.close();
+                      } catch (Exception e) {
+                          /* egal */
+                      }
+                  }
+              }
+
+              @PluginMethod
+              public void batteryStatus(PluginCall call) {
+                  JSObject o = new JSObject();
+                  try {
+                      PowerManager pm = (PowerManager) getContext().getSystemService(Context.POWER_SERVICE);
+                      boolean ign = Build.VERSION.SDK_INT < 23 || (pm != null && pm.isIgnoringBatteryOptimizations(getContext().getPackageName()));
+                      o.put("unrestricted", ign);
+                  } catch (Exception e) {
+                      o.put("unrestricted", false);
+                  }
+                  call.resolve(o);
+              }
+
+              /* Fragt, ob die App im Hintergrund ohne Akku-Sparen laufen darf (damit Benachrichtigungen sicher ankommen). */
+              @PluginMethod
+              public void batteryAsk(PluginCall call) {
+                  try {
+                      Intent i = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+                      i.setData(Uri.parse("package:" + getContext().getPackageName()));
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                      getContext().startActivity(i);
+                      call.resolve();
+                  } catch (Exception e) {
+                      call.reject(String.valueOf(e.getMessage()));
+                  }
+              }
+
+              /* Android-Einstellungen: "app" = App-Info, "notify" = Benachrichtigungen, sonst Kanal mit dieser ID. */
+              @PluginMethod
+              public void openSettings(PluginCall call) {
+                  try {
+                      String what = call.getString("what", "app");
+                      String pkg = getContext().getPackageName();
+                      Intent i;
+                      if ("notify".equals(what) && Build.VERSION.SDK_INT >= 26) {
+                          i = new Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS);
+                          i.putExtra(Settings.EXTRA_APP_PACKAGE, pkg);
+                      } else if (what != null && what.startsWith("ch:") && Build.VERSION.SDK_INT >= 26) {
+                          i = new Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS);
+                          i.putExtra(Settings.EXTRA_APP_PACKAGE, pkg);
+                          i.putExtra(Settings.EXTRA_CHANNEL_ID, what.substring(3));
+                      } else {
+                          i = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS);
+                          i.setData(Uri.parse("package:" + pkg));
+                      }
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                      getContext().startActivity(i);
+                      call.resolve();
+                  } catch (Exception e) {
+                      call.reject(String.valueOf(e.getMessage()));
+                  }
+              }
+          }
+          EOF
+          cat > $P/MainActivity.java <<'EOF'
+          package com.opferchat.app;
+
+          import android.content.Intent;
+          import android.os.Bundle;
+          import android.webkit.WebView;
+
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  registerPlugin(OcNativePlugin.class);
+                  super.onCreate(savedInstanceState);
+                  if (savedInstanceState == null) OcNativePlugin.handleIntent(getIntent());
+              }
+
+              @Override
+              protected void onNewIntent(Intent intent) {
+                  super.onNewIntent(intent);
+                  OcNativePlugin.handleIntent(intent);
+              }
+
+              @Override
+              public void onPause() {
+                  super.onPause();
+                  /* Waehrend eines Anrufs soll die Seite im Hintergrund weiterlaufen. */
+                  if (OcNativePlugin.callActive) {
+                      try {
+                          WebView w = getBridge().getWebView();
+                          w.onResume();
+                          w.resumeTimers();
+                      } catch (Exception e) {
+                          /* egal */
+                      }
+                  }
+              }
+          }
+          EOF
+          cat > patch_manifest.py <<'EOF'
+          # Traegt Rechte, Dienst und Links in die AndroidManifest.xml ein. Aufruf: python3 patch_manifest.py <Pfad> <1=mit eigenen Teilen | 0=ohne>
+          import sys, xml.dom.minidom
+          path, custom = sys.argv[1], sys.argv[2] == '1'
+          s = open(path, encoding='utf8').read()
+          PERMS = ['ACCESS_NETWORK_STATE', 'CAMERA', 'RECORD_AUDIO', 'MODIFY_AUDIO_SETTINGS', 'ACCESS_FINE_LOCATION', 'ACCESS_COARSE_LOCATION',
+                   'POST_NOTIFICATIONS', 'VIBRATE', 'WAKE_LOCK', 'RECEIVE_BOOT_COMPLETED', 'SCHEDULE_EXACT_ALARM', 'USE_FULL_SCREEN_INTENT',
+                   'BLUETOOTH_CONNECT', 'READ_MEDIA_IMAGES', 'READ_MEDIA_VIDEO', 'USE_BIOMETRIC', 'REQUEST_IGNORE_BATTERY_OPTIMIZATIONS']
+          if custom:
+              PERMS += ['FOREGROUND_SERVICE', 'FOREGROUND_SERVICE_MICROPHONE', 'FOREGROUND_SERVICE_CAMERA']
+          FEATS = ['android.hardware.camera', 'android.hardware.camera.autofocus', 'android.hardware.microphone', 'android.hardware.location',
+                   'android.hardware.bluetooth', 'android.hardware.fingerprint']
+          add = ''
+          for p in PERMS:
+              if 'android.permission.%s"' % p not in s:
+                  add += '    <uses-permission android:name="android.permission.%s" />\n' % p
+          for f in FEATS:
+              if '"%s"' % f not in s:
+                  add += '    <uses-feature android:name="%s" android:required="false" />\n' % f
+          i = s.rindex('</manifest>')
+          s = s[:i] + add + s[i:]
+          if 'largeHeap' not in s:
+              s = s.replace('<application', '<application\n        android:largeHeap="true"', 1)
+          if custom:
+              if 'CallService' not in s:
+                  svc = '        <service android:name=".CallService" android:exported="false" android:foregroundServiceType="microphone|camera" />\n'
+                  i = s.rindex('</application>')
+                  s = s[:i] + svc + s[i:]
+              if 'android:scheme="opferchat"' not in s:
+                  flt = '''            <intent-filter android:autoVerify="true">
+                          <action android:name="android.intent.action.VIEW" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <category android:name="android.intent.category.BROWSABLE" />
+                          <data android:scheme="https" android:host="opferchat.com" />
+                      </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.intent.action.VIEW" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <category android:name="android.intent.category.BROWSABLE" />
+                          <data android:scheme="opferchat" />
+                      </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.intent.action.SEND" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <data android:mimeType="text/plain" />
+                      </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.intent.action.SEND" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <data android:mimeType="image/*" />
+                      </intent-filter>
+          '''
+                  i = s.index('</activity>')
+                  s = s[:i] + flt + '        ' + s[i:]
+          xml.dom.minidom.parseString(s.encode('utf8'))  # muss gueltiges XML sein, sonst Abbruch
+          open(path, 'w', encoding='utf8').write(s)
+          print('Manifest ok, custom=%s' % custom)
+          EOF
+          R=android/app/src/main/res
+          mkdir -p $R/raw
+          base64 -d > $R/raw/oc_ring.ogg <<'EOF'
+          T2dnUwACAAAAAAAAAABRjeHlAAAAABS1yFoBHgF2b3JiaXMAAAAAASJWAAAAAAAA7HYAAAAAAACp
+          AU9nZ1MAAAAAAAAAAAAAUY3h5QEAAAB6jUFeDkD////////////////FA3ZvcmJpcw0AAABMYXZm
+          NjAuMTYuMTAwAQAAAB8AAABlbmNvZGVyPUxhdmM2MC4zMS4xMDIgbGlidm9yYmlzAQV2b3JiaXMi
+          QkNWAQBAAAAYQhAqBa1jjjrIFSGMGaKgQsopxx1C0CGjJEOIOsY1xxhjR7lkikLJgdCQVQAAQAAA
+          pBxXUHJJLeecc6MYV8xx6CDnnHPlIGfMcQkl55xzjjnnknKOMeecc6MYVw5yKS3nnHOBFEeKcacY
+          55xzpBxHinGoGOecc20xt5JyzjnnnHPmIIdScq4155xzpBhnDnILJeecc8YgZ8xx6yDnnHOMNbfU
+          cs4555xzzjnnnHPOOeecc4wx55xzzjnnnHNuMecWc64555xzzjnnHHPOOeeccyA0ZBUAkAAAoKEo
+          iuIoDhAasgoAyAAAEEBxFEeRFEuxHMvRJA0IDVkFAAABAAgAAKBIhqRIiqVYjmZpniZ6oiiaoiqr
+          smnKsizLsuu6LhAasgoASAAAUFEUxXAUBwgNWQUAZAAACGAoiqM4juRYkqVZngeEhqwCAIAAAAQA
+          AFAMR7EUTfEkz/I8z/M8z/M8z/M8z/M8z/M8z/M8DQgNWQUAIAAAAIIoZBgDQkNWAQBAAAAIIRoZ
+          Q51SElwKFkIcEUMdQs5DqaWD4CmFJWPSU6xBCCF87z333nvvgdCQVQAAEAAAYRQ4iIHHJAghhGIU
+          J0RxpiAIIYTlJFjKeegkCN2DEEK4nHvLuffeeyA0ZBUAAAgAwCCEEEIIIYQQQggppJRSSCmmmGKK
+          Kcccc8wxxyCDDDLooJNOOsmkkk46yiSjjlJrKbUUU0yx5RZjrbXWnHOvQSljjDHGGGOMMcYYY4wx
+          xhgjCA1ZBQCAAAAQBhlkkEEIIYQUUkgppphyzDHHHANCQ1YBAIAAAAIAAAAcRVIkR3IkR5IkyZIs
+          SZM8y7M8y7M8TdRETRVV1VVt1/ZtX/Zt39Vl3/Zl29VlXZZl3bVtXdZdXdd1Xdd1Xdd1Xdd1Xdd1
+          XdeB0JBVAIAEAICO5DiO5DiO5EiOpEgKEBqyCgCQAQAQAICjOIrjSI7kWI4lWZImaZZneZaneZqo
+          iR4QGrIKAAAEABAAAAAAAICiKIqjOI4kWZamaZ6neqIomqqqiqapqqpqmqZpmqZpmqZpmqZpmqZp
+          mqZpmqZpmqZpmqZpmqZpmqZpAqEhqwAACQAAHcdxHEdxHMdxJEeSJCA0ZBUAIAMAIAAAQ1EcRXIs
+          x5I0S7M8y9NEz/RcUTZ1U1dtIDRkFQAACAAgAAAAAAAAx3M8x3M8yZM8y3M8x5M8SdM0TdM0TdM0
+          TdM0TdM0TdM0TdM0TdM0TdM0TdM0TdM0TdM0TdM0TdM0TQNCQ1YCAGQAABCTkEpOsVdGKcYktF4q
+          pBST1HuomGJMOu2pQgYpB7mHSiGloNPeMqWQUgx7p5hCyBjqoYOQMYWw19pzz733HggNWREARAEA
+          AMYgxhBjyDEmJYMSMcckZFIi55yUTkompaRWWsykhJhKi5FzTkonJZNSWgupZZJKayWmAgAAAhwA
+          AAIshEJDVgQAUQAAiDFIKaQUUkoxp5hDSinHlGNIKeWcck45x5h0ECrnGHQOSqSUco45p5xzEjIH
+          lXMOQiadAACAAAcAgAALodCQFQFAnAAAgJBzijEIEWMQQgkphVBSqpyT0kFJqYOSUkmpxZJSjJVz
+          UjoJKXUSUiopxVhSii2kVGNpLdfSUo0txpxbjL2GlGItqdVaWqu5xVhzizX3yDlKnZTWOimtpdZq
+          Ta3V2klpLaTWYmktxtZizSnGnDMprYWWYiupxdhiyzW1mHNpLdcUY88pxp5rrLnHnIMwrdWcWss5
+          xZh7zLHnmHMPknOUOimtdVJaS63VmlqrNZPSWmmtxpBaiy3GnFuLMWdSWiypxVhaijHFmHOLLdfQ
+          Wq4pxpxTiznHWoOSsfZeWqs5xZh7iq3nmHMwNseeO0q5ltZ6Lq31XnMuQtbci2gt59RqDyrGnnPO
+          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
+          EOF
+          base64 -d > $R/raw/oc_msg.ogg <<'EOF'
+          T2dnUwACAAAAAAAAAAAofs6BAAAAAAymvVgBHgF2b3JiaXMAAAAAASJWAAAAAAAA7HYAAAAAAACp
+          AU9nZ1MAAAAAAAAAAAAAKH7OgQEAAADdv/zjDkD////////////////FA3ZvcmJpcw0AAABMYXZm
+          NjAuMTYuMTAwAQAAAB8AAABlbmNvZGVyPUxhdmM2MC4zMS4xMDIgbGlidm9yYmlzAQV2b3JiaXMi
+          QkNWAQBAAAAYQhAqBa1jjjrIFSGMGaKgQsopxx1C0CGjJEOIOsY1xxhjR7lkikLJgdCQVQAAQAAA
+          pBxXUHJJLeecc6MYV8xx6CDnnHPlIGfMcQkl55xzjjnnknKOMeecc6MYVw5yKS3nnHOBFEeKcacY
+          55xzpBxHinGoGOecc20xt5JyzjnnnHPmIIdScq4155xzpBhnDnILJeecc8YgZ8xx6yDnnHOMNbfU
+          cs4555xzzjnnnHPOOeecc4wx55xzzjnnnHNuMecWc64555xzzjnnHHPOOeeccyA0ZBUAkAAAoKEo
+          iuIoDhAasgoAyAAAEEBxFEeRFEuxHMvRJA0IDVkFAAABAAgAAKBIhqRIiqVYjmZpniZ6oiiaoiqr
+          smnKsizLsuu6LhAasgoASAAAUFEUxXAUBwgNWQUAZAAACGAoiqM4juRYkqVZngeEhqwCAIAAAAQA
+          AFAMR7EUTfEkz/I8z/M8z/M8z/M8z/M8z/M8z/M8DQgNWQUAIAAAAIIoZBgDQkNWAQBAAAAIIRoZ
+          Q51SElwKFkIcEUMdQs5DqaWD4CmFJWPSU6xBCCF87z333nvvgdCQVQAAEAAAYRQ4iIHHJAghhGIU
+          J0RxpiAIIYTlJFjKeegkCN2DEEK4nHvLuffeeyA0ZBUAAAgAwCCEEEIIIYQQQggppJRSSCmmmGKK
+          Kcccc8wxxyCDDDLooJNOOsmkkk46yiSjjlJrKbUUU0yx5RZjrbXWnHOvQSljjDHGGGOMMcYYY4wx
+          xhgjCA1ZBQCAAAAQBhlkkEEIIYQUUkgppphyzDHHHANCQ1YBAIAAAAIAAAAcRVIkR3IkR5IkyZIs
+          SZM8y7M8y7M8TdRETRVV1VVt1/ZtX/Zt39Vl3/Zl29VlXZZl3bVtXdZdXdd1Xdd1Xdd1Xdd1Xdd1
+          XdeB0JBVAIAEAICO5DiO5DiO5EiOpEgKEBqyCgCQAQAQAICjOIrjSI7kWI4lWZImaZZneZaneZqo
+          iR4QGrIKAAAEABAAAAAAAICiKIqjOI4kWZamaZ6neqIomqqqiqapqqpqmqZpmqZpmqZpmqZpmqZp
+          mqZpmqZpmqZpmqZpmqZpmqZpAqEhqwAACQAAHcdxHEdxHMdxJEeSJCA0ZBUAIAMAIAAAQ1EcRXIs
+          x5I0S7M8y9NEz/RcUTZ1U1dtIDRkFQAACAAgAAAAAAAAx3M8x3M8yZM8y3M8x5M8SdM0TdM0TdM0
+          TdM0TdM0TdM0TdM0TdM0TdM0TdM0TdM0TdM0TdM0TdM0TQNCQ1YCAGQAABCTkEpOsVdGKcYktF4q
+          pBST1HuomGJMOu2pQgYpB7mHSiGloNPeMqWQUgx7p5hCyBjqoYOQMYWw19pzz733HggNWREARAEA
+          AMYgxhBjyDEmJYMSMcckZFIi55yUTkompaRWWsykhJhKi5FzTkonJZNSWgupZZJKayWmAgAAAhwA
+          AAIshEJDVgQAUQAAiDFIKaQUUkoxp5hDSinHlGNIKeWcck45x5h0ECrnGHQOSqSUco45p5xzEjIH
+          lXMOQiadAACAAAcAgAALodCQFQFAnAAAgJBzijEIEWMQQgkphVBSqpyT0kFJqYOSUkmpxZJSjJVz
+          UjoJKXUSUiopxVhSii2kVGNpLdfSUo0txpxbjL2GlGItqdVaWqu5xVhzizX3yDlKnZTWOimtpdZq
+          Ta3V2klpLaTWYmktxtZizSnGnDMprYWWYiupxdhiyzW1mHNpLdcUY88pxp5rrLnHnIMwrdWcWss5
+          xZh7zLHnmHMPknOUOimtdVJaS63VmlqrNZPSWmmtxpBaiy3GnFuLMWdSWiypxVhaijHFmHOLLdfQ
+          Wq4pxpxTiznHWoOSsfZeWqs5xZh7iq3nmHMwNseeO0q5ltZ6Lq31XnMuQtbci2gt59RqDyrGnnPO
+          wdjcgxCt5Zxq7D3F2HvuORjbc/Ct1uBbzUXInIPQufimezBG1dqDzLUImXMQOugidPDJeJRqLq3l
+          XFrrPdYafM05CNFa7inG3lOLvdeem7C9ByFayz3F2IOKMfiaczA652JUrcHHnIOQtRahey9K5yCU
+          qrUHmWtQMtcidPDF6KCLLwAAYMABACDAhDJQaMiKACBOAIBByDmlGIRKKQihhJRCKClVjEnImIOS
+          MSellFJaCCW1ijEImWNSMsekhBJaKiW0EkppqZTSWiiltZZajCm1FkMpqYVSWiultJZaqjG1VmPE
+          mJTMOSmZY1JKKa2VUlqrHJOSMSipg5BKKSnFUlKLlXNSMuiodBBKKqnEVFJpraTSUimlxZJSbCnF
+          VFuLtYZSWiypxFZSajG1VFuLMdeIMSkZc1Iy56SUUlIrpbSWOSelg45K5qCkklJrpaQUM+akdA5K
+          yiCjUlKKLaUSUyiltZJSbKWk1lqMtabUWi0ltVZSarGUEluLMdcWS02dlNZKKjGGUlprMeaaWosx
+          lBJbKSnGkkpsrcWaW2w5hlJaLKnEVkpqsdWWY2ux5tRSjSm1mltsucaUU4+19pxaqzW1VGNrseZY
+          W2+11pw7Ka2FUlorJcWYWouxxVhzKCW2klJspaQYW2y5thZjD6G0WEpqsaQSY2sx5hhbjqm1Wlts
+          uabUYq219hxbbj2lFmuLsebSUo01195jTTkVAAAw4AAAEGBCGSg0ZCUAEAUAABjDGGMQGqWcc05K
+          g5RzzknJnIMQQkqZcxBCSClzTkJKLWXOQUiptVBKSq3FFkpJqbUWCwAAKHAAAAiwQVNicYBCQ1YC
+          AFEAAIgxSjEGoTFGKecgNMYoxRiESinGnJNQKcWYc1Ayx5yDUErmnHMQSgkhlFJKSiGEUkpJqQAA
+          gAIHAIAAGzQlFgcoNGRFABAFAAAYY5wzziEKnaXOUiSpo9ZRayilGkuMncZWe+u50xp7bbk3lEqN
+          qdaOa8u51d5pTT23HAsAADtwAAA7sBAKDVkJAOQBABDGKMWYc84ZhRhzzjnnDFKMOeecc4ox55yD
+          EELFmHPOQQghc845CKGEkjnnHIQQSuicg1BKKaV0zkEIoZRSOucghFJKKZ1zEEoppZQCAIAKHAAA
+          AmwU2ZxgJKjQkJUAQB4AAGAMQs5Jaa1hzDkILdXYMMYclJRii5yDkFKLuUbMQUgpxqA7KCm1GGzw
+          nYSUWos5B5NSizXn3oNIqbWag8491VZzz733nGKsNefecy8AAHfBAQDswEaRzQlGggoNWQkA5AEA
+          EAgpxZhzzhmlGHPMOeeMUowx5pxzijHGnHPOQcUYY845ByFjzDnnIISQMeaccxBC6JxzDkIIIXTO
+          OQchhBA656CDEEIInXMQQgghhAIAgAocAAACbBTZnGAkqNCQlQBAOAAAACGEEEIIIYQQQgghhBBC
+          CCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQggh
+          hBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBC6JxzzjnnnHPO
+          Oeecc84555xzzjknAMi3wgHA/8HGGVaSzgpHgwsNWQkAhAMAAApBKKViEEopJZJOOimdk1BKKZGD
+          UkrppJRSSgmllFJKCKWUUkoIHZRSQimllFJKKaWUUkoppZRSOimllFJKKaWUyjkppZNSSimlRM5J
+          KSGUUkoppYRSSimllFJKKaWUUkoppZRSSimlhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQggh
+          hBBCCCGEAgC4GxwAIBJsnGEl6axwNLjQkJUAQEgAAKAUc45KCCmUkFKomKKOQikppFJKChFjzknq
+          HIVQUiipg8o5CKWklEIqIXXOQQclhZBSCSGVjjroKJRQUiollNI5KKWEFEpKKZWQQkipdJRSKCWV
+          lEIqIZVSSkgllRBKCp2kVEoKqaRUUgiddJBCJyWkkkoKqZOUUiolpZRKSiV0UkIqKaUQQkqplBBK
+          SCmlTlJJqaQUQighhZRSSiWlkkpKIZVUQgmlpJRSKKGkVFJKKaWSUikAAODAAQAgwAg6yaiyCBtN
+          uPAAFBqyEgAgAwBAlHTWaadJIggxRZknDSnGILWkLMMQU5KJ8RRjjDkoRkMOMeSUGBdKCKGDYjwm
+          lUPKUFG5t9Q5BcUWY3zvsRcBAAAIAgAEhAQAGCAomAEABgcIIwcCHQEEDm0AgIEImQkMCqHBQSYA
+          PEBESAUAiQmK0oUuCCGCdBFk8cCFEzeeuOGEDm0QAAAAAAAQAPABAJBQABER0cxVWFxgZGhscHR4
+          fICEBAAAAAAACAB8AAAkIkBERDRzFRYXGBkaGxwdHh8gIQEAAAAAAAAAAEBAQAAAAAAAIAAAAEBA
+          T2dnUwAErjMAAAAAAAAofs6BAgAAAO18wUweHxweHCMkKScePB0eGx0bHB0jHx8gJSYfHSMfIBsX
+          PK0bfz7XFQdaCFoIAACo9hEfK05uNRMBoK4vTQYAAFSxc9x5X/0DcAgwAAAAGZrrIt5cUgAAv8kA
+          AACa+jo49U9x3wjfK2JKtgoLAAAAAHxIiQAwDDcOAAD+uTrY94+wbl32ThFjslUoAAAAAPhJIgBg
+          nwIAXnk69P+a/jEVr5HHQUiBbBUKBKUAAAD/YwAA+gMAoOEkAOa+GDr0/+yfLs2rJr8F5JE1CF8E
+          AH8CAECxAgAUSAwAzBs48ACeGFr9n/70UrxutrWo8kLWEKUEBTwGAMC/EgAM2H1OeqxXBU5HwwOg
+          A5YYqv/R99q83uxvUSUjW4UBIUoAAEC9CQAgrwPgFED/CEDpADRIAAyhz5Pw/OJAQAAIQgAA+BkK
+          AFD7AwAAOsDSwEJKAASf7/mq22UBJBzXOgAAPjD+vgR9GJ3HZjaPIH0I/tkp1gJzLYPBYDAYDAaD
+          wWAwGAwGg36Dq+4KdUAAAFQx6qNnuDtAB7QDAICYN4l52ypRiXyMAACAuycBGisrqz/nnXOGVww5
+          IMmBBQAAAAAA4n9tAAAAw6wA3vpy8ffPjWeGl5dFDkAGAAAAAACsMwHg358Bntpy8ffPjfcBLy+L
+          HFDkQAcAAAAAADx3AACAqQpeunLx98+N9wEvL4scMGQAAAAAAMBNBoDffwX+mWL29//G+yA/ymWT
+          kQMLAAAAAABDQwEA3qMIvnmi9PzEeH+XPb9nfLmHHIAMAAAAAACYLABwfwN+WcL0/Np4f9fn8ZDz
+          5XnkgCEHOoAAAAAAAJ8AAADI9gLMAD5JwvT82nh/1/N4yDlkyAFFBhAAAAAA4EcB4PwFLAD+KNLo
+          /FZ3f9f1eMw5vGTkwAIQAAAAAKIdAAC/ELAAvgjS7vx2f7rBHg849JUcgBQEAQAAAADWKfD2nZBd
+          Bw2eCPLJ+d3xfb75+IAjXskByAFACAAAAAB8BAAAINsBrYB8ADoAnviR4fws7P7+Px5x8Cs5ACkI
+          UYICAADArwC/2CuABcAIgI4EIAGeCKLp+Um8Bz75HYdeycgBQBAAAAAA1B4AgBskAWAEngjC6fkJ
+          5Pn+5EccfCUjBSEAAMANA3j70EAHoACeCILhuPJ7J9z5puDQjIwcAIQACgAAgB0AAH87FljdA1gA
+          Ep4IIt1x5dduOPOxPIcmMlIQBAgAAL8m8Isd2AMLCACeCBLjsdu383vlszxHBCk5AAgCBAAAAEgF
+          QKuhABqQAJ4ICmPn/7oTGi9P6ycjBUEAAAAeJ/CpeQAYA54oeiyjve4N8K5LFhkpAAAAoJ9eBbxS
+          EOF
+          base64 -d > $R/raw/oc_rq.ogg <<'EOF'
+          T2dnUwACAAAAAAAAAABT3OGUAAAAAMVcgSMBHgF2b3JiaXMAAAAAASJWAAAAAAAA7HYAAAAAAACp
+          AU9nZ1MAAAAAAAAAAAAAU9zhlAEAAADSVu1SDkD////////////////FA3ZvcmJpcw0AAABMYXZm
+          NjAuMTYuMTAwAQAAAB8AAABlbmNvZGVyPUxhdmM2MC4zMS4xMDIgbGlidm9yYmlzAQV2b3JiaXMi
+          QkNWAQBAAAAYQhAqBa1jjjrIFSGMGaKgQsopxx1C0CGjJEOIOsY1xxhjR7lkikLJgdCQVQAAQAAA
+          pBxXUHJJLeecc6MYV8xx6CDnnHPlIGfMcQkl55xzjjnnknKOMeecc6MYVw5yKS3nnHOBFEeKcacY
+          55xzpBxHinGoGOecc20xt5JyzjnnnHPmIIdScq4155xzpBhnDnILJeecc8YgZ8xx6yDnnHOMNbfU
+          cs4555xzzjnnnHPOOeecc4wx55xzzjnnnHNuMecWc64555xzzjnnHHPOOeeccyA0ZBUAkAAAoKEo
+          iuIoDhAasgoAyAAAEEBxFEeRFEuxHMvRJA0IDVkFAAABAAgAAKBIhqRIiqVYjmZpniZ6oiiaoiqr
+          smnKsizLsuu6LhAasgoASAAAUFEUxXAUBwgNWQUAZAAACGAoiqM4juRYkqVZngeEhqwCAIAAAAQA
+          AFAMR7EUTfEkz/I8z/M8z/M8z/M8z/M8z/M8z/M8DQgNWQUAIAAAAIIoZBgDQkNWAQBAAAAIIRoZ
+          Q51SElwKFkIcEUMdQs5DqaWD4CmFJWPSU6xBCCF87z333nvvgdCQVQAAEAAAYRQ4iIHHJAghhGIU
+          J0RxpiAIIYTlJFjKeegkCN2DEEK4nHvLuffeeyA0ZBUAAAgAwCCEEEIIIYQQQggppJRSSCmmmGKK
+          Kcccc8wxxyCDDDLooJNOOsmkkk46yiSjjlJrKbUUU0yx5RZjrbXWnHOvQSljjDHGGGOMMcYYY4wx
+          xhgjCA1ZBQCAAAAQBhlkkEEIIYQUUkgppphyzDHHHANCQ1YBAIAAAAIAAAAcRVIkR3IkR5IkyZIs
+          SZM8y7M8y7M8TdRETRVV1VVt1/ZtX/Zt39Vl3/Zl29VlXZZl3bVtXdZdXdd1Xdd1Xdd1Xdd1Xdd1
+          XdeB0JBVAIAEAICO5DiO5DiO5EiOpEgKEBqyCgCQAQAQAICjOIrjSI7kWI4lWZImaZZneZaneZqo
+          iR4QGrIKAAAEABAAAAAAAICiKIqjOI4kWZamaZ6neqIomqqqiqapqqpqmqZpmqZpmqZpmqZpmqZp
+          mqZpmqZpmqZpmqZpmqZpmqZpAqEhqwAACQAAHcdxHEdxHMdxJEeSJCA0ZBUAIAMAIAAAQ1EcRXIs
+          x5I0S7M8y9NEz/RcUTZ1U1dtIDRkFQAACAAgAAAAAAAAx3M8x3M8yZM8y3M8x5M8SdM0TdM0TdM0
+          TdM0TdM0TdM0TdM0TdM0TdM0TdM0TdM0TdM0TdM0TdM0TQNCQ1YCAGQAABCTkEpOsVdGKcYktF4q
+          pBST1HuomGJMOu2pQgYpB7mHSiGloNPeMqWQUgx7p5hCyBjqoYOQMYWw19pzz733HggNWREARAEA
+          AMYgxhBjyDEmJYMSMcckZFIi55yUTkompaRWWsykhJhKi5FzTkonJZNSWgupZZJKayWmAgAAAhwA
+          AAIshEJDVgQAUQAAiDFIKaQUUkoxp5hDSinHlGNIKeWcck45x5h0ECrnGHQOSqSUco45p5xzEjIH
+          lXMOQiadAACAAAcAgAALodCQFQFAnAAAgJBzijEIEWMQQgkphVBSqpyT0kFJqYOSUkmpxZJSjJVz
+          UjoJKXUSUiopxVhSii2kVGNpLdfSUo0txpxbjL2GlGItqdVaWqu5xVhzizX3yDlKnZTWOimtpdZq
+          Ta3V2klpLaTWYmktxtZizSnGnDMprYWWYiupxdhiyzW1mHNpLdcUY88pxp5rrLnHnIMwrdWcWss5
+          xZh7zLHnmHMPknOUOimtdVJaS63VmlqrNZPSWmmtxpBaiy3GnFuLMWdSWiypxVhaijHFmHOLLdfQ
+          Wq4pxpxTiznHWoOSsfZeWqs5xZh7iq3nmHMwNseeO0q5ltZ6Lq31XnMuQtbci2gt59RqDyrGnnPO
+          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
+          Sm5bbeuN9woGskl9AADwX88BzO24Bw==
+          EOF
+          ls -la $R/raw
+          # Mehr Arbeitsspeicher fuer den Build, Lint bricht den Build nicht ab
+          echo "org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8" >> android/gradle.properties
+          python3 - <<'PY'
+          import re
+          p='android/app/build.gradle'
+          s=open(p,encoding='utf8').read()
+          if 'checkReleaseBuilds' not in s:
+              s=re.sub(r'^android \{', 'android {\n    lint {\n        checkReleaseBuilds false\n        abortOnError false\n    }', s, count=1, flags=re.M)
+          open(p,'w',encoding='utf8').write(s)
+          PY
+          grep -n "lint" -A3 android/app/build.gradle | head
       - name: App-Symbol und Startbild
         run: |
           command -v convert || (sudo apt-get update && sudo apt-get install -y imagemagick)
@@ -69,10 +846,9 @@ jobs:
         run: |
           cd app/android
           M=app/src/main/AndroidManifest.xml
-          for p in CAMERA RECORD_AUDIO MODIFY_AUDIO_SETTINGS ACCESS_FINE_LOCATION ACCESS_COARSE_LOCATION POST_NOTIFICATIONS VIBRATE; do
-            grep -q "android.permission.$p\"" $M || sed -i "s#</manifest>#    <uses-permission android:name=\"android.permission.$p\" />\n</manifest>#" $M
-          done
           grep -q default_notification_icon $M || sed -i 's#</application>#    <meta-data android:name="com.google.firebase.messaging.default_notification_icon" android:resource="@drawable/ic_stat_notify" />\n        <meta-data android:name="com.google.firebase.messaging.default_notification_color" android:resource="@color/notify_color" />\n    </application>#' $M
+          cp $M $M.base
+          python3 ../patch_manifest.py $M 1
           sed -i "s/versionCode 1$/versionCode ${{ github.run_number }}/; s/versionName \"1.0\"/versionName \"1.0.${{ github.run_number }}\"/" app/build.gradle
           grep -n "versionCode\|versionName" app/build.gradle
           cat $M
@@ -82,15 +858,47 @@ jobs:
         run: |
           cd app/android
           chmod +x gradlew
-          ./gradlew assembleRelease --no-daemon
+          build() { ./gradlew assembleRelease --no-daemon; }
+          drop() { L=$(cat "$1"); (cd .. && for n in $L; do npm uninstall --no-audit --no-fund "$n" || true; done && npx cap sync android); }
+          LEVEL=""
+          if build; then LEVEL="voll"; fi
+          if [ -z "$LEVEL" ]; then
+            echo "::warning::Bauen mit allen Zusatzfunktionen hat nicht geklappt. Nächster Versuch ohne die Community-Plugins."
+            drop ../opt_community_ok.txt; : > ../opt_community_ok.txt
+            if build; then LEVEL="ohne Community-Plugins"; fi
+          fi
+          if [ -z "$LEVEL" ]; then
+            echo "::warning::Nächster Versuch ohne alle Zusatz-Plugins."
+            drop ../opt_official_ok.txt; : > ../opt_official_ok.txt
+            if build; then LEVEL="nur eigene Funktionen"; fi
+          fi
+          if [ -z "$LEVEL" ]; then
+            echo "::warning::Letzter Versuch ohne die eigenen Android-Teile."
+            P=app/src/main/java/com/opferchat/app
+            cp ../MainActivity.java.orig $P/MainActivity.java; rm -f $P/OcNativePlugin.java $P/CallService.java
+            cp app/src/main/AndroidManifest.xml.base app/src/main/AndroidManifest.xml
+            python3 ../patch_manifest.py app/src/main/AndroidManifest.xml 0
+            if build; then LEVEL="Basis"; fi
+          fi
+          if [ -z "$LEVEL" ]; then echo "::error::Die App ließ sich in keiner Stufe bauen."; exit 1; fi
+          echo "Ergebnis: $LEVEL"
           BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
           $BT/zipalign -p -f 4 app/build/outputs/apk/release/app-release-unsigned.apk aligned.apk
           $BT/apksigner sign --ks ../../opferchat.jks --ks-pass env:KEY_PASS --key-pass env:KEY_PASS --out ../../Opferchat.apk aligned.apk
           $BT/apksigner verify ../../Opferchat.apk
+          {
+            echo "Android-App für Opferchat. Herunterladen, öffnen und installieren."
+            echo
+            echo "Umfang: $LEVEL"
+            echo
+            echo "Enthaltene Zusatz-Plugins:"
+            cat ../opt_official_ok.txt ../opt_community_ok.txt | sed 's/^/- /'
+          } > ../../release_body.md
+          cat ../../release_body.md >> "$GITHUB_STEP_SUMMARY"
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: v1.0.${{ github.run_number }}
           name: Opferchat App 1.0.${{ github.run_number }}
-          body: Android-App für Opferchat. Herunterladen, öffnen und installieren.
+          body_path: release_body.md
           files: Opferchat.apk
           make_latest: true
