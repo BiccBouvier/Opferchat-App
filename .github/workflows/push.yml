@@ -115,8 +115,12 @@ jobs:
               for (const [k, v] of Object.entries(all[u] || {})) {
                 if (!v || !v.t || budget.left < 1) continue;
                 budget.left--;
+                // Neue App (s: 2): eigene Kanäle mit eigenen Klingeltönen
+                const s2 = v.s === 2;
+                const ch = s2 ? (o.type === 'rq' ? 'oc_rq' : o.channel === 'calls' ? 'oc_calls' : 'oc_msgs') : o.channel;
+                const snd = s2 ? ({ oc_rq: 'oc_rq', oc_calls: 'oc_ring', oc_msgs: 'oc_msg' })[ch] : 'default';
                 const msg = { message: { token: v.t, notification: { title: o.title, body: o.body }, data: { gid, type: o.type },
-                  android: { priority: 'HIGH', ttl: o.ttl || '86400s', notification: { channel_id: o.channel, tag: o.type === 'call' ? 'call_' + gid : gid, icon: 'ic_stat_notify', color: '#ffe14d', sound: 'default' } } } };
+                  android: { priority: 'HIGH', ttl: o.ttl || '86400s', notification: { channel_id: ch, tag: o.type === 'call' ? 'call_' + gid : gid, icon: 'ic_stat_notify', color: '#ffe14d', sound: snd } } } };
                 const r = await fetch('https://fcm.googleapis.com/v1/projects/' + env.PROJECT_ID + '/messages:send', { method: 'POST', headers: { Authorization: 'Bearer ' + t, 'Content-Type': 'application/json' }, body: JSON.stringify(msg) });
                 if (r.ok) n++;
                 else { const e = await r.text(); if ((r.status === 404 || /UNREGISTERED/.test(e)) && budget.left > 0) { budget.left--; try { await db(env, 'push/' + u + '/' + k, { m: 'DELETE' }) } catch (x) { } } else console.log('fcm', r.status, e.slice(0, 200)) }
