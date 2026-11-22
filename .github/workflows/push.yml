@@ -150,6 +150,23 @@ jobs:
               const who = (await db(env, 'users/' + uid + '/name')) || 'Jemand';
               return { n: await send(env, [rid], 'rq', uid, { title: 'Nachrichtenanfrage', body: who + ' möchte dir schreiben', channel: 'msgs', type: 'rq' }, budget) };
             }
+            // Anfrage im Feed: nur der öffentliche Name und der Text gehen raus, nie das Konto dahinter
+            if (body.frq) {
+              const tp = String(body.frq || '');
+              if (!/^[A-Za-z0-9_-]{6,40}$/.test(tp)) return { e: 'frq' };
+              const ap = await db(env, 'users/' + uid + '/fp');
+              if (typeof ap !== 'string' || ap === tp) return { e: 'nofp' };
+              const r = await db(env, 'freq/' + tp + '/' + ap);
+              if (!r || r.s !== 0 || Date.now() - (r.ts || 0) > 600000) return { e: 'nofrq' };
+              const rid = await db(env, 'fpo/' + tp);
+              if (typeof rid !== 'string' || !/^[A-Za-z0-9]{6,64}$/.test(rid)) return { e: 'nofpo' };
+              const done = await db(env, 'pushd/frq_' + tp + '/' + ap);
+              if (done && done === r.ts) return { n: 0 };
+              await db(env, 'pushd/frq_' + tp + '/' + ap, { m: 'PUT', b: r.ts });
+              const who = (await db(env, 'fpub/' + ap + '/n')) || 'Jemand';
+              const txt = typeof r.t === 'string' ? r.t.slice(0, 150) : '';
+              return { n: await send(env, [rid], 'frq', uid, { title: 'Anfrage im Feed', body: txt ? who + ': ' + txt : who + ' hat dir eine Anfrage geschickt', channel: 'msgs', type: 'rq' }, budget) };
+            }
             const gid = String(body.gid || '');
             if (!/^[A-Za-z0-9_-]{1,120}$/.test(gid)) return { e: 'gid' };
             const pub = gid === 'allgemein';
