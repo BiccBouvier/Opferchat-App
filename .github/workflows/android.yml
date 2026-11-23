@@ -433,7 +433,25 @@ jobs:
               public void onCreate(Bundle savedInstanceState) {
                   registerPlugin(OcNativePlugin.class);
                   super.onCreate(savedInstanceState);
+                  fixTextZoom();
                   if (savedInstanceState == null) OcNativePlugin.handleIntent(getIntent());
+              }
+
+              /* Feste Groesse: Die Schriftgroesse des Handys soll die App nicht zusammenquetschen oder auseinanderziehen.
+                 Grosse Schrift gibt es in der App selbst (Einstellungen, Schrift und Groesse). */
+              private void fixTextZoom() {
+                  try {
+                      WebView w = getBridge().getWebView();
+                      w.getSettings().setTextZoom(100);
+                  } catch (Exception e) {
+                      /* egal */
+                  }
+              }
+
+              @Override
+              public void onResume() {
+                  super.onResume();
+                  fixTextZoom();
               }
 
               @Override
@@ -813,6 +831,8 @@ jobs:
           s=open(p,encoding='utf8').read()
           if 'checkReleaseBuilds' not in s:
               s=re.sub(r'^android \{', 'android {\n    lint {\n        checkReleaseBuilds false\n        abortOnError false\n    }', s, count=1, flags=re.M)
+          if 'useLegacyPackaging' not in s:
+              s=re.sub(r'^android \{', 'android {\n    packaging {\n        jniLibs {\n            useLegacyPackaging = true\n        }\n    }', s, count=1, flags=re.M)
           open(p,'w',encoding='utf8').write(s)
           PY
           grep -n "lint" -A3 android/app/build.gradle | head
@@ -895,10 +915,41 @@ jobs:
             cat ../opt_official_ok.txt ../opt_community_ok.txt | sed 's/^/- /'
           } > ../../release_body.md
           cat ../../release_body.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Testversionen bauen (ohne QR-Scanner, Basis)
+        continue-on-error: true
+        env:
+          KEY_PASS: ${{ secrets.KEY_PASS }}
+        run: |
+          cd app/android
+          BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
+          sign() { $BT/zipalign -p -f 4 app/build/outputs/apk/release/app-release-unsigned.apk aligned2.apk && $BT/apksigner sign --ks ../../opferchat.jks --ks-pass env:KEY_PASS --key-pass env:KEY_PASS --out "../../$1" aligned2.apk && $BT/apksigner verify "../../$1"; }
+          # 1) wie die volle App, nur ohne QR-Scanner (damit ohne eingebaute Programmbibliotheken)
+          if grep -qx '@capacitor-mlkit/barcode-scanning' ../opt_community_ok.txt; then
+            (cd .. && npm uninstall --no-audit --no-fund @capacitor-mlkit/barcode-scanning && npx cap sync android)
+            ./gradlew assembleRelease --no-daemon && sign Opferchat-ohne-QR.apk || echo "::warning::Testversion ohne QR-Scanner ließ sich nicht bauen"
+          fi
+          # 2) Basis: wie die App vor dieser Version, ohne Zusatz-Plugins und ohne eigene Android-Teile
+          L=$(cat ../opt_official_ok.txt ../opt_community_ok.txt | grep -vx '@capacitor-mlkit/barcode-scanning' || true)
+          (cd .. && for n in $L; do npm uninstall --no-audit --no-fund "$n" || true; done && npx cap sync android)
+          P=app/src/main/java/com/opferchat/app
+          cp ../MainActivity.java.orig $P/MainActivity.java; rm -f $P/OcNativePlugin.java $P/CallService.java
+          cp app/src/main/AndroidManifest.xml.base app/src/main/AndroidManifest.xml
+          python3 ../patch_manifest.py app/src/main/AndroidManifest.xml 0
+          ./gradlew assembleRelease --no-daemon && sign Opferchat-Basis.apk || echo "::warning::Basis-Testversion ließ sich nicht bauen"
+          ls -la ../../*.apk
+          {
+            echo
+            echo "Falls Opferchat.apk sich nicht installieren lässt, zum Testen:"
+            [ -f ../../Opferchat-ohne-QR.apk ] && echo "- Opferchat-ohne-QR.apk: alles außer dem QR-Scanner"
+            [ -f ../../Opferchat-Basis.apk ] && echo "- Opferchat-Basis.apk: nur die Grundfunktionen wie vorher"
+          } >> ../../release_body.md
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: v1.0.${{ github.run_number }}
           name: Opferchat App 1.0.${{ github.run_number }}
           body_path: release_body.md
-          files: Opferchat.apk
+          files: |
+            Opferchat.apk
+            Opferchat-ohne-QR.apk
+            Opferchat-Basis.apk
           make_latest: true
