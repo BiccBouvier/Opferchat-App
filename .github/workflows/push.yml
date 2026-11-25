@@ -114,12 +114,16 @@ jobs:
               if (mu) continue;
               for (const [k, v] of Object.entries(all[u] || {})) {
                 if (!v || !v.t || budget.left < 1) continue;
+                // Nur die neue App (s: 3) kann Anrufe selbst als Vollbild zeigen und das Klingeln beenden
+                const s3 = v.s >= 3;
+                if (o.s3only && !s3) continue;
                 budget.left--;
                 // Neue App (s: 2): eigene Kanäle mit eigenen Klingeltönen
                 const s2 = v.s === 2;
                 const ch = s2 ? (o.type === 'rq' ? 'oc_rq' : o.channel === 'calls' ? 'oc_calls' : 'oc_msgs') : o.channel;
                 const snd = s2 ? ({ oc_rq: 'oc_rq', oc_calls: 'oc_ring', oc_msgs: 'oc_msg' })[ch] : 'default';
-                const msg = { message: { token: v.t, notification: { title: o.title, body: o.body }, data: { gid, type: o.type },
+                const msg = s3 && o.data ? { message: { token: v.t, data: o.data, android: { priority: 'HIGH', ttl: o.ttl || '45s' } } } :
+                  { message: { token: v.t, notification: { title: o.title, body: o.body }, data: { gid, type: o.type },
                   android: { priority: 'HIGH', ttl: o.ttl || '86400s', notification: { channel_id: ch, tag: o.type === 'call' ? 'call_' + gid : gid, icon: 'ic_stat_notify', color: '#ffe14d', sound: snd } } } };
                 const r = await fetch('https://fcm.googleapis.com/v1/projects/' + env.PROJECT_ID + '/messages:send', { method: 'POST', headers: { Authorization: 'Bearer ' + t, 'Content-Type': 'application/json' }, body: JSON.stringify(msg) });
                 if (r.ok) n++;
@@ -175,13 +179,22 @@ jobs:
             const members = pub ? [] : Object.keys(g.dm || g.members || {});
             if (!pub && !members.includes(uid)) return { e: 'member' };
             const NM = {}; const name = async u => { if (NM[u]) return NM[u]; try { NM[u] = (await db(env, 'users/' + u + '/name')) || 'Jemand' } catch (e) { NM[u] = 'Jemand' } return NM[u] };
+            // Anruf vorbei, abgelehnt oder woanders angenommen: Klingeln auf den Handys beenden (self: nur die eigenen Geräte)
+            if (body.callend) {
+              if (pub) return { e: 'pub' };
+              const self = !!body.self;
+              if (!self) { const info = await db(env, 'calls/' + gid + '/info'); if (info && info.by !== uid) return { e: 'notcaller' } }
+              return { n: await send(env, self ? [uid] : members, gid, null, { type: 'callend', s3only: true, ttl: '60s', data: { type: 'callend', gid } }, budget) };
+            }
             if (body.call) {
               if (pub) return { e: 'pub' };
               const info = await db(env, 'calls/' + gid + '/info');
               if (!info || info.by !== uid || Date.now() - (info.ts || 0) > 90000) return { e: 'nocall' };
               const who = await name(uid);
               const title = (info.v ? '📹 ' : '📞 ') + who + (g.dm ? ' ruft dich an' : ' ruft in ' + (g.name || 'der Gruppe') + ' an');
-              return { n: await send(env, members.filter(u => u !== uid), gid, uid, { title, body: info.v ? 'Videoanruf · Tippen zum Annehmen' : 'Sprachanruf · Tippen zum Annehmen', channel: 'calls', type: 'call', ttl: '45s' }, budget) };
+              // Neue App: nur Daten, die App klingelt selbst und zeigt den Anruf als Vollbild
+              const data = { type: 'call', gid, by: uid, n: String(who).slice(0, 60), v: info.v ? '1' : '0', g: g.dm ? '' : String(g.name || '').slice(0, 60), ts: String(info.ts || Date.now()) };
+              return { n: await send(env, members.filter(u => u !== uid), gid, uid, { title, body: info.v ? 'Videoanruf · Tippen zum Annehmen' : 'Sprachanruf · Tippen zum Annehmen', channel: 'calls', type: 'call', ttl: '45s', data }, budget) };
             }
             const ms = (await db(env, 'chatmsgs/' + gid, { q: 'orderBy=%22%24key%22&limitToLast=4' })) || {};
             const done = (await db(env, 'pushd/' + gid, { q: 'orderBy=%22%24key%22&limitToLast=12' })) || {};

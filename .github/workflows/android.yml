@@ -64,18 +64,50 @@ jobs:
           import android.app.NotificationChannel;
           import android.app.NotificationManager;
           import android.app.PendingIntent;
+          import android.app.Person;
           import android.app.Service;
+          import android.content.Context;
           import android.content.Intent;
           import android.content.pm.ServiceInfo;
+          import android.graphics.drawable.Icon;
           import android.os.Build;
+          import android.os.Bundle;
           import android.os.IBinder;
           import android.os.PowerManager;
 
-          /* Haelt waehrend eines Anrufs das Mikrofon (und die Verbindung) am Leben, auch wenn die App nicht vorne ist. */
+          /* Hält während eines Anrufs das Mikrofon (und die Verbindung) am Leben, auch wenn die App nicht vorne ist.
+             Zeigt dazu die Anruf-Benachrichtigung mit Stumm, Lautsprecher oder Kamera und Auflegen
+             (ab Android 12 als Anruf oben in der Statusleiste). */
           public class CallService extends Service {
-              static final String CHANNEL = "oc_call_running";
+              static final String CHANNEL = "oc_call_live";
+              static final String OLD_CHANNEL = "oc_call_running";
               static final int NOTE_ID = 7101;
+              static volatile CallService inst = null;
+              static volatile State last = null;
               private PowerManager.WakeLock wl;
+
+              static final class State {
+                  String name = "Opferchat";
+                  String status = "";
+                  boolean muted = false;
+                  boolean speaker = true;
+                  boolean cam = false;
+                  boolean video = false;
+                  boolean spkBtn = false;
+                  long since = 0;
+              }
+
+              /* Neuer Stand von der Webseite (stumm, Lautsprecher, Kamera, Name, verbunden seit) */
+              static void update(Context c, State s) {
+                  last = s;
+                  CallService me = inst;
+                  if (me == null) return;
+                  try {
+                      me.post(s);
+                  } catch (Exception e) {
+                      /* egal */
+                  }
+              }
 
               @Override
               public IBinder onBind(Intent intent) {
@@ -84,33 +116,19 @@ jobs:
 
               @Override
               public int onStartCommand(Intent intent, int flags, int startId) {
+                  inst = this;
                   String title = intent != null ? intent.getStringExtra("title") : null;
-                  String text = intent != null ? intent.getStringExtra("text") : null;
                   boolean video = intent != null && intent.getBooleanExtra("video", false);
-                  if (title == null) title = "Opferchat";
-                  if (text == null) text = "Anruf läuft";
+                  State s = last;
+                  if (s == null) {
+                      s = new State();
+                      if (title != null && !title.isEmpty()) s.name = title;
+                      s.video = video;
+                      s.cam = video;
+                      last = s;
+                  }
                   try {
-                      NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
-                      if (Build.VERSION.SDK_INT >= 26 && nm != null) {
-                          NotificationChannel ch = new NotificationChannel(CHANNEL, "Laufender Anruf", NotificationManager.IMPORTANCE_LOW);
-                          ch.setShowBadge(false);
-                          nm.createNotificationChannel(ch);
-                      }
-                      Intent open = new Intent(this, MainActivity.class);
-                      open.addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
-                      int pf = PendingIntent.FLAG_UPDATE_CURRENT;
-                      if (Build.VERSION.SDK_INT >= 23) pf |= PendingIntent.FLAG_IMMUTABLE;
-                      PendingIntent pi = PendingIntent.getActivity(this, 0, open, pf);
-                      Notification.Builder b = Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(this, CHANNEL) : new Notification.Builder(this);
-                      int icon = getResources().getIdentifier("ic_stat_notify", "drawable", getPackageName());
-                      b.setSmallIcon(icon != 0 ? icon : getApplicationInfo().icon);
-                      b.setContentTitle(title);
-                      b.setContentText(text);
-                      b.setContentIntent(pi);
-                      b.setOngoing(true);
-                      b.setOnlyAlertOnce(true);
-                      if (Build.VERSION.SDK_INT >= 21) b.setCategory(Notification.CATEGORY_CALL);
-                      Notification n = b.build();
+                      Notification n = build(s);
                       boolean ok = false;
                       if (Build.VERSION.SDK_INT >= 30) {
                           try {
@@ -146,6 +164,93 @@ jobs:
                   return START_NOT_STICKY;
               }
 
+              private void post(State s) {
+                  NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+                  if (nm != null) nm.notify(NOTE_ID, build(s));
+              }
+
+              private void ensureChannel(NotificationManager nm) {
+                  if (Build.VERSION.SDK_INT < 26 || nm == null) return;
+                  if (nm.getNotificationChannel(CHANNEL) == null) {
+                      NotificationChannel ch = new NotificationChannel(CHANNEL, IncomingCall.label(this, "running", "Laufender Anruf"), NotificationManager.IMPORTANCE_DEFAULT);
+                      ch.setShowBadge(false);
+                      ch.setSound(null, null);
+                      ch.enableVibration(false);
+                      ch.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
+                      nm.createNotificationChannel(ch);
+                  }
+                  try {
+                      if (nm.getNotificationChannel(OLD_CHANNEL) != null) nm.deleteNotificationChannel(OLD_CHANNEL);
+                  } catch (Exception e) {
+                      /* egal */
+                  }
+              }
+
+              private PendingIntent actPI(String what, int rc) {
+                  Intent i = new Intent(this, CallActionReceiver.class);
+                  i.setAction(CallActionReceiver.ACT);
+                  i.putExtra("a", what);
+                  return PendingIntent.getBroadcast(this, 7300 + rc, i, IncomingCall.piFlags());
+              }
+
+              private Notification.Action act(String label, PendingIntent pi) {
+                  Icon ic = Icon.createWithResource(this, IncomingCall.smallIcon(this));
+                  return new Notification.Action.Builder(ic, label, pi).build();
+              }
+
+              private Notification build(State s) {
+                  NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+                  ensureChannel(nm);
+                  Intent open = new Intent(this, MainActivity.class);
+                  open.setAction(IncomingCall.ACT_OPEN);
+                  open.putExtra("act", "open");
+                  open.putExtra("gid", "-");
+                  open.addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                  PendingIntent pi = PendingIntent.getActivity(this, 7310, open, IncomingCall.piFlags());
+                  Notification.Builder b = Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(this, CHANNEL) : new Notification.Builder(this);
+                  b.setSmallIcon(IncomingCall.smallIcon(this));
+                  b.setContentTitle(s.name);
+                  String kind = s.video ? IncomingCall.label(this, "video", "Videoanruf") : IncomingCall.label(this, "voice", "Sprachanruf");
+                  String text = s.status != null && !s.status.isEmpty() ? s.status : kind;
+                  if (s.muted) text = text + " · " + IncomingCall.label(this, "muted", "stumm");
+                  b.setContentText(text);
+                  b.setContentIntent(pi);
+                  b.setOngoing(true);
+                  b.setOnlyAlertOnce(true);
+                  b.setCategory(Notification.CATEGORY_CALL);
+                  b.setVisibility(Notification.VISIBILITY_PUBLIC);
+                  if (s.since > 0) {
+                      b.setWhen(s.since);
+                      b.setShowWhen(true);
+                      b.setUsesChronometer(true);
+                  } else {
+                      b.setShowWhen(false);
+                  }
+                  PendingIntent hang = actPI("hang", 1);
+                  Notification.Action mute = act(s.muted ? IncomingCall.label(this, "unmute", "Ton an") : IncomingCall.label(this, "mute", "Stumm"), actPI("mute", 2));
+                  Notification.Action third;
+                  if (s.spkBtn && !s.video && !s.cam) {
+                      third = act(s.speaker ? IncomingCall.label(this, "ear", "Hörer") : IncomingCall.label(this, "spk", "Lautsprecher"), actPI("spk", 3));
+                  } else {
+                      third = act(s.cam ? IncomingCall.label(this, "camoff", "Kamera aus") : IncomingCall.label(this, "cam", "Kamera"), actPI("cam", 4));
+                  }
+                  if (Build.VERSION.SDK_INT >= 31) {
+                      Person p = new Person.Builder().setName(s.name).setIcon(Icon.createWithBitmap(IncomingCall.letter(s.name))).setImportant(true).build();
+                      b.setStyle(Notification.CallStyle.forOngoingCall(p, hang).setIsVideo(s.video));
+                      b.addAction(mute);
+                      b.addAction(third);
+                  } else {
+                      b.addAction(act(IncomingCall.label(this, "hang", "Auflegen"), hang));
+                      b.addAction(mute);
+                      b.addAction(third);
+                  }
+                  /* Android 16: als "Live-Update" oben anzeigen (z. B. in der Kapsel um die Kamera) */
+                  Bundle ex = new Bundle();
+                  ex.putBoolean("android.requestPromotedOngoing", true);
+                  b.addExtras(ex);
+                  return b.build();
+              }
+
               private void release() {
                   try {
                       if (wl != null && wl.isHeld()) wl.release();
@@ -163,6 +268,8 @@ jobs:
 
               @Override
               public void onDestroy() {
+                  if (inst == this) inst = null;
+                  last = null;
                   release();
                   super.onDestroy();
               }
@@ -171,9 +278,13 @@ jobs:
           cat > $P/OcNativePlugin.java <<'EOF'
           package com.opferchat.app;
 
+          import android.app.Activity;
+          import android.app.KeyguardManager;
+          import android.app.NotificationManager;
           import android.content.ContentResolver;
           import android.content.Context;
           import android.content.Intent;
+          import android.content.SharedPreferences;
           import android.media.AudioManager;
           import android.net.Uri;
           import android.os.Build;
@@ -193,10 +304,34 @@ jobs:
           /* Eigene Android-Funktionen fuer Opferchat. Die Webseite ruft sie ueber Capacitor.Plugins.OcNative auf. */
           @CapacitorPlugin(name = "OcNative")
           public class OcNativePlugin extends Plugin {
-              static final int VERSION = 2;
+              static final int VERSION = 3;
               static volatile boolean callActive = false;
               static volatile JSObject pendingShare = null;
+              static volatile JSObject pendingCall = null;
+              static volatile OcNativePlugin inst = null;
               private PowerManager.WakeLock prox;
+
+              @Override
+              public void load() {
+                  inst = this;
+              }
+
+              /* Ereignis an die Webseite (callAction, callLaunch) */
+              static void emit(String ev, JSObject data) {
+                  OcNativePlugin p = inst;
+                  if (p == null) return;
+                  try {
+                      p.notifyListeners(ev, data);
+                  } catch (Exception e) {
+                      /* egal */
+                  }
+              }
+
+              /* Die App wurde wegen eines Anrufs geöffnet (Klingeln, Annehmen, Nachricht, laufender Anruf) */
+              static void setLaunch(JSObject o) {
+                  pendingCall = o;
+                  emit("callLaunch", new JSObject());
+              }
 
               /* Wird von MainActivity aufgerufen: Text oder Bild, das in Opferchat geteilt wurde. */
               static void handleIntent(Intent in) {
@@ -365,6 +500,165 @@ jobs:
                   }
               }
 
+              /* Anruf, mit dem die App geöffnet wurde. Wird beim Abholen gelöscht. */
+              @PluginMethod
+              public void getLaunch(PluginCall call) {
+                  JSObject o = pendingCall;
+                  pendingCall = null;
+                  call.resolve(o != null ? o : new JSObject());
+              }
+
+              /* Android-Klingeln beenden (die Webseite zeigt den Anruf jetzt selbst) */
+              @PluginMethod
+              public void ringStop(PluginCall call) {
+                  IncomingCall.cancel(getContext(), null);
+                  call.resolve();
+              }
+
+              /* Stand des laufenden Anrufs für die Anruf-Benachrichtigung */
+              @PluginMethod
+              public void callUpdate(PluginCall call) {
+                  JSObject d = call.getData();
+                  CallService.State s = new CallService.State();
+                  s.name = d.optString("n", "Opferchat");
+                  if (s.name.isEmpty()) s.name = "Opferchat";
+                  s.status = d.optString("st", "");
+                  s.muted = d.optBoolean("m", false);
+                  s.speaker = d.optBoolean("s", true);
+                  s.cam = d.optBoolean("c", false);
+                  s.video = d.optBoolean("v", false);
+                  s.spkBtn = d.optBoolean("sp", false);
+                  s.since = d.optLong("t", 0L);
+                  CallService.update(getContext(), s);
+                  call.resolve();
+              }
+
+              /* Anmeldeschlüssel und Texte für das Ablehnen bei geschlossener App. Bleibt nur auf diesem Handy. */
+              @PluginMethod
+              public void setAuth(PluginCall call) {
+                  JSObject d = call.getData();
+                  SharedPreferences.Editor e = getContext().getSharedPreferences(IncomingCall.PREF, Context.MODE_PRIVATE).edit();
+                  e.putString("rt", d.optString("rt", ""));
+                  e.putString("key", d.optString("key", ""));
+                  e.putString("db", d.optString("db", ""));
+                  e.putString("uid", d.optString("uid", ""));
+                  Object lb = d.opt("lb");
+                  if (lb != null) e.putString("lb", lb.toString());
+                  e.apply();
+                  call.resolve();
+              }
+
+              @PluginMethod
+              public void clearAuth(PluginCall call) {
+                  getContext().getSharedPreferences(IncomingCall.PREF, Context.MODE_PRIVATE).edit().clear().apply();
+                  call.resolve();
+              }
+
+              /* Darf die App Anrufe als Vollbild zeigen? (ab Android 14 eine eigene Erlaubnis) */
+              @PluginMethod
+              public void fsiStatus(PluginCall call) {
+                  JSObject o = new JSObject();
+                  boolean can = true;
+                  try {
+                      if (Build.VERSION.SDK_INT >= 34) {
+                          NotificationManager nm = (NotificationManager) getContext().getSystemService(Context.NOTIFICATION_SERVICE);
+                          can = nm != null && nm.canUseFullScreenIntent();
+                      }
+                  } catch (Exception e) {
+                      can = true;
+                  }
+                  o.put("can", can);
+                  call.resolve(o);
+              }
+
+              @PluginMethod
+              public void fsiAsk(PluginCall call) {
+                  try {
+                      Intent i;
+                      if (Build.VERSION.SDK_INT >= 34) {
+                          i = new Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT);
+                          i.setData(Uri.parse("package:" + getContext().getPackageName()));
+                      } else {
+                          i = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS);
+                          i.setData(Uri.parse("package:" + getContext().getPackageName()));
+                      }
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                      getContext().startActivity(i);
+                      call.resolve();
+                  } catch (Exception e) {
+                      call.reject(String.valueOf(e.getMessage()));
+                  }
+              }
+
+              /* Anruf über dem Sperrbildschirm zeigen (an) oder wieder dahinter (aus) */
+              @PluginMethod
+              public void lockMode(PluginCall call) {
+                  final boolean on = Boolean.TRUE.equals(call.getBoolean("on", false));
+                  final Activity a = getActivity();
+                  if (a != null) {
+                      a.runOnUiThread(new Runnable() {
+                          @Override
+                          public void run() {
+                              MainActivity.lockMode(a, on);
+                          }
+                      });
+                  }
+                  call.resolve();
+              }
+
+              @PluginMethod
+              public void isLocked(PluginCall call) {
+                  JSObject o = new JSObject();
+                  o.put("locked", MainActivity.isLocked(getContext()));
+                  call.resolve(o);
+              }
+
+              /* Handy entsperren lassen (z. B. bevor man vom Anruf in die Chats geht) */
+              @PluginMethod
+              public void unlock(final PluginCall call) {
+                  final Activity a = getActivity();
+                  if (a == null || Build.VERSION.SDK_INT < 26) {
+                      done(call, true);
+                      return;
+                  }
+                  a.runOnUiThread(new Runnable() {
+                      @Override
+                      public void run() {
+                          try {
+                              KeyguardManager km = (KeyguardManager) a.getSystemService(Context.KEYGUARD_SERVICE);
+                              if (km == null || !km.isKeyguardLocked()) {
+                                  done(call, true);
+                                  return;
+                              }
+                              km.requestDismissKeyguard(a, new KeyguardManager.KeyguardDismissCallback() {
+                                  @Override
+                                  public void onDismissSucceeded() {
+                                      done(call, true);
+                                  }
+
+                                  @Override
+                                  public void onDismissCancelled() {
+                                      done(call, false);
+                                  }
+
+                                  @Override
+                                  public void onDismissError() {
+                                      done(call, false);
+                                  }
+                              });
+                          } catch (Exception e) {
+                              done(call, false);
+                          }
+                      }
+                  });
+              }
+
+              private static void done(PluginCall call, boolean ok) {
+                  JSObject o = new JSObject();
+                  o.put("ok", ok);
+                  call.resolve(o);
+              }
+
               @PluginMethod
               public void batteryStatus(PluginCall call) {
                   JSObject o = new JSObject();
@@ -419,22 +713,453 @@ jobs:
               }
           }
           EOF
+          cat > $P/IncomingCall.java <<'EOF'
+          package com.opferchat.app;
+
+          import android.app.Activity;
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Person;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.graphics.Bitmap;
+          import android.graphics.Canvas;
+          import android.graphics.Color;
+          import android.graphics.Paint;
+          import android.graphics.Typeface;
+          import android.graphics.drawable.Icon;
+          import android.media.AudioAttributes;
+          import android.media.RingtoneManager;
+          import android.net.Uri;
+          import android.os.Build;
+
+          import com.getcapacitor.JSObject;
+
+          import org.json.JSONObject;
+
+          import java.io.ByteArrayOutputStream;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.net.URLEncoder;
+          import java.util.Map;
+
+          /* Eingehender Anruf, wenn die App zu ist oder im Hintergrund: klingelt und zeigt den Anruf als Vollbild (auch auf dem Sperrbildschirm). */
+          public final class IncomingCall {
+              static final String CH = "oc_calls";
+              static final String TAG = "oc_ring";
+              static final int NID = 7102;
+              static final String PREF = "oc_auth";
+              static final String ACT_OPEN = "com.opferchat.app.CALL_OPEN";
+              static final String ACT_DECLINE = "com.opferchat.app.CALL_DECLINE";
+              static volatile String activeGid = null;
+              static volatile long activeUntil = 0;
+              static volatile JSObject activeData = null;
+
+              private IncomingCall() {
+              }
+
+              static boolean isActive() {
+                  return activeGid != null && System.currentTimeMillis() < activeUntil;
+              }
+
+              /* Push vom Opferchat-Dienst: {type:call, gid, by, n, v, g, ts} */
+              static void onPush(Context c, Map<String, String> d) {
+                  if (d == null) return;
+                  String gid = d.get("gid");
+                  if (gid == null || !gid.matches("[A-Za-z0-9_-]{1,120}")) return;
+                  /* Ist die App vorne, klingelt die Webseite selbst */
+                  if (MainActivity.fg) return;
+                  String name = d.get("n");
+                  if (name == null || name.trim().isEmpty()) name = "Opferchat";
+                  if (name.length() > 60) name = name.substring(0, 60);
+                  boolean video = "1".equals(d.get("v"));
+                  String grp = d.get("g");
+                  if (grp != null && grp.length() > 60) grp = grp.substring(0, 60);
+                  long ts = 0;
+                  try {
+                      String t = d.get("ts");
+                      if (t != null) ts = Long.parseLong(t);
+                  } catch (Exception e) {
+                      ts = 0;
+                  }
+                  show(c, gid, name, video, grp, d.get("by"), ts);
+              }
+
+              static void show(Context c, String gid, String name, boolean video, String grp, String by, long ts) {
+                  try {
+                      NotificationManager nm = (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
+                      if (nm == null) return;
+                      ensureChannel(c, nm);
+                      String kind = video ? label(c, "video", "Videoanruf") : label(c, "voice", "Sprachanruf");
+                      String text = grp != null && !grp.isEmpty() ? kind + " · " + grp : kind;
+                      PendingIntent full = openPI(c, gid, "ring", 1, name, video, by, ts);
+                      PendingIntent accept = openPI(c, gid, "accept", 2, name, video, by, ts);
+                      PendingIntent msg = openPI(c, gid, "msg", 3, name, video, by, ts);
+                      Intent di = new Intent(c, CallActionReceiver.class);
+                      di.setAction(ACT_DECLINE);
+                      di.putExtra("gid", gid);
+                      di.putExtra("ts", ts);
+                      PendingIntent decline = PendingIntent.getBroadcast(c, 7204, di, piFlags());
+                      Notification.Builder b = Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(c, CH) : new Notification.Builder(c);
+                      int icon = smallIcon(c);
+                      b.setSmallIcon(icon);
+                      b.setContentTitle(name);
+                      b.setContentText(text);
+                      b.setCategory(Notification.CATEGORY_CALL);
+                      b.setVisibility(Notification.VISIBILITY_PUBLIC);
+                      b.setOngoing(true);
+                      b.setAutoCancel(false);
+                      b.setContentIntent(full);
+                      b.setFullScreenIntent(full, true);
+                      if (Build.VERSION.SDK_INT >= 26) {
+                          b.setTimeoutAfter(46000);
+                      } else {
+                          setLegacyAlert(b, c);
+                      }
+                      Icon ai = Icon.createWithResource(c, icon);
+                      if (Build.VERSION.SDK_INT >= 31) {
+                          Person p = new Person.Builder().setName(name).setIcon(Icon.createWithBitmap(letter(name))).setImportant(true).build();
+                          b.setStyle(Notification.CallStyle.forIncomingCall(p, decline, accept).setIsVideo(video));
+                          b.addAction(new Notification.Action.Builder(ai, label(c, "msg", "Nachricht"), msg).build());
+                      } else {
+                          b.addAction(new Notification.Action.Builder(ai, label(c, "decline", "Ablehnen"), decline).build());
+                          b.addAction(new Notification.Action.Builder(ai, label(c, "msg", "Nachricht"), msg).build());
+                          b.addAction(new Notification.Action.Builder(ai, label(c, "accept", "Annehmen"), accept).build());
+                      }
+                      Notification n = b.build();
+                      n.flags |= Notification.FLAG_INSISTENT;
+                      JSObject o = new JSObject();
+                      o.put("gid", gid);
+                      o.put("n", name);
+                      o.put("v", video);
+                      o.put("by", by != null ? by : "");
+                      o.put("ts", ts);
+                      activeData = o;
+                      activeGid = gid;
+                      activeUntil = System.currentTimeMillis() + 46000;
+                      nm.notify(TAG, NID, n);
+                  } catch (Exception e) {
+                      /* ohne Benachrichtigungs-Recht geht es nicht */
+                  }
+              }
+
+              @SuppressWarnings("deprecation")
+              private static void setLegacyAlert(Notification.Builder b, Context c) {
+                  b.setPriority(Notification.PRIORITY_MAX);
+                  b.setSound(ringUri(c));
+                  b.setVibrate(new long[]{0, 600, 400, 600});
+              }
+
+              /* Klingeln beenden (gid null = egal welcher Anruf) */
+              static void cancel(Context c, String gid) {
+                  String a = activeGid;
+                  if (gid != null && a != null && !gid.equals(a)) return;
+                  activeGid = null;
+                  activeUntil = 0;
+                  activeData = null;
+                  try {
+                      NotificationManager nm = (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
+                      if (nm != null) nm.cancel(TAG, NID);
+                  } catch (Exception e) {
+                      /* egal */
+                  }
+              }
+
+              /* App wird geöffnet, während es noch klingelt: der Webseite sagen, dass Android schon klingelt */
+              static void resumeCheck(Activity a) {
+                  try {
+                      if (!isActive() || OcNativePlugin.pendingCall != null) return;
+                      JSObject d = activeData;
+                      JSObject o = new JSObject();
+                      o.put("gid", activeGid);
+                      o.put("act", "ring");
+                      if (d != null) {
+                          o.put("n", d.optString("n", ""));
+                          o.put("v", d.optBoolean("v", false));
+                          o.put("by", d.optString("by", ""));
+                          o.put("ts", d.optLong("ts", 0));
+                      }
+                      o.put("locked", MainActivity.isLocked(a));
+                      OcNativePlugin.setLaunch(o);
+                  } catch (Exception e) {
+                      /* egal */
+                  }
+              }
+
+              static PendingIntent openPI(Context c, String gid, String act, int rc, String name, boolean video, String by, long ts) {
+                  Intent i = new Intent(c, MainActivity.class);
+                  i.setAction(ACT_OPEN);
+                  i.putExtra("gid", gid);
+                  i.putExtra("act", act);
+                  i.putExtra("n", name);
+                  i.putExtra("v", video);
+                  i.putExtra("by", by != null ? by : "");
+                  i.putExtra("ts", ts);
+                  i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                  return PendingIntent.getActivity(c, 7200 + rc, i, piFlags());
+              }
+
+              static int piFlags() {
+                  int f = PendingIntent.FLAG_UPDATE_CURRENT;
+                  if (Build.VERSION.SDK_INT >= 23) f |= PendingIntent.FLAG_IMMUTABLE;
+                  return f;
+              }
+
+              static int smallIcon(Context c) {
+                  int icon = c.getResources().getIdentifier("ic_stat_notify", "drawable", c.getPackageName());
+                  return icon != 0 ? icon : c.getApplicationInfo().icon;
+              }
+
+              static Uri ringUri(Context c) {
+                  int id = c.getResources().getIdentifier("oc_ring", "raw", c.getPackageName());
+                  if (id != 0) return Uri.parse("android.resource://" + c.getPackageName() + "/" + id);
+                  return RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE);
+              }
+
+              /* Den Kanal legt sonst die Webseite an (mit dem Klingelton, den man in den Einstellungen ändern kann) */
+              static void ensureChannel(Context c, NotificationManager nm) {
+                  if (Build.VERSION.SDK_INT < 26) return;
+                  if (nm.getNotificationChannel(CH) != null) return;
+                  NotificationChannel ch = new NotificationChannel(CH, label(c, "ch", "Anrufe"), NotificationManager.IMPORTANCE_HIGH);
+                  ch.setDescription(label(c, "chd", "Wenn dich jemand anruft"));
+                  ch.enableVibration(true);
+                  ch.setVibrationPattern(new long[]{0, 600, 400, 600});
+                  ch.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
+                  AudioAttributes aa = new AudioAttributes.Builder()
+                          .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+                          .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                          .build();
+                  ch.setSound(ringUri(c), aa);
+                  nm.createNotificationChannel(ch);
+              }
+
+              /* Texte in der Sprache der App (schickt die Webseite mit), sonst Deutsch */
+              static String label(Context c, String k, String def) {
+                  try {
+                      String j = c.getSharedPreferences(PREF, Context.MODE_PRIVATE).getString("lb", "");
+                      if (j == null || j.isEmpty()) return def;
+                      String v = new JSONObject(j).optString(k, "");
+                      return v.isEmpty() ? def : v;
+                  } catch (Exception e) {
+                      return def;
+                  }
+              }
+
+              /* Rundes Bild mit dem ersten Buchstaben des Namens */
+              static Bitmap letter(String name) {
+                  int s = 128;
+                  Bitmap bm = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888);
+                  Canvas cv = new Canvas(bm);
+                  int[] cols = {0xFF5B6CFF, 0xFFFF7A59, 0xFF20A058, 0xFFD99A00, 0xFFB45CFF, 0xFF00A3C4};
+                  String nm = name == null ? "" : name.trim();
+                  int h = (nm.hashCode() & 0x7fffffff) % cols.length;
+                  Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  p.setColor(cols[h]);
+                  cv.drawCircle(s / 2f, s / 2f, s / 2f, p);
+                  p.setColor(Color.WHITE);
+                  p.setTextSize(s * 0.46f);
+                  p.setTextAlign(Paint.Align.CENTER);
+                  p.setTypeface(Typeface.DEFAULT_BOLD);
+                  String ch = nm.isEmpty() ? "?" : nm.substring(0, nm.offsetByCodePoints(0, 1)).toUpperCase();
+                  Paint.FontMetrics fm = p.getFontMetrics();
+                  float y = s / 2f - (fm.ascent + fm.descent) / 2f;
+                  cv.drawText(ch, s / 2f, y, p);
+                  return bm;
+              }
+
+              /* Ablehnen, ohne die App zu öffnen: mit dem gespeicherten Anmeldeschlüssel direkt in die Datenbank schreiben */
+              static void declineRest(Context c, String gid, long ts) {
+                  try {
+                      if (gid == null || !gid.matches("[A-Za-z0-9_-]{1,120}")) return;
+                      SharedPreferences sp = c.getSharedPreferences(PREF, Context.MODE_PRIVATE);
+                      String rt = sp.getString("rt", ""), key = sp.getString("key", ""), db = sp.getString("db", ""), uid = sp.getString("uid", "");
+                      if (rt == null || key == null || db == null || uid == null) return;
+                      if (rt.isEmpty() || key.isEmpty() || !db.startsWith("https://") || !uid.matches("[A-Za-z0-9_-]{1,128}")) return;
+                      String body = "grant_type=refresh_token&refresh_token=" + URLEncoder.encode(rt, "UTF-8");
+                      JSONObject tok = new JSONObject(http("POST", "https://securetoken.googleapis.com/v1/token?key=" + URLEncoder.encode(key, "UTF-8"), body, "application/x-www-form-urlencoded"));
+                      String id = tok.optString("id_token", "");
+                      String nrt = tok.optString("refresh_token", "");
+                      if (id.isEmpty()) return;
+                      if (!nrt.isEmpty() && !nrt.equals(rt)) sp.edit().putString("rt", nrt).apply();
+                      JSONObject w = new JSONObject();
+                      w.put("ring/" + uid + "/" + gid, JSONObject.NULL);
+                      if (ts == 0 || Math.abs(System.currentTimeMillis() - ts) < 120000) {
+                          JSONObject sv = new JSONObject();
+                          sv.put(".sv", "timestamp");
+                          w.put("calls/" + gid + "/dec/" + uid, sv);
+                      }
+                      String base = db.endsWith("/") ? db.substring(0, db.length() - 1) : db;
+                      http("PATCH", base + "/.json?auth=" + URLEncoder.encode(id, "UTF-8"), w.toString(), "application/json");
+                  } catch (Exception e) {
+                      /* dann merkt der Anrufer es erst nach 45 Sekunden */
+                  }
+              }
+
+              static String http(String method, String url, String body, String type) throws Exception {
+                  HttpURLConnection h = (HttpURLConnection) new URL(url).openConnection();
+                  try {
+                      h.setConnectTimeout(8000);
+                      h.setReadTimeout(8000);
+                      if ("PATCH".equals(method)) {
+                          h.setRequestMethod("POST");
+                          h.setRequestProperty("X-HTTP-Method-Override", "PATCH");
+                      } else {
+                          h.setRequestMethod(method);
+                      }
+                      if (body != null) {
+                          h.setDoOutput(true);
+                          h.setRequestProperty("Content-Type", type);
+                          byte[] bs = body.getBytes("UTF-8");
+                          OutputStream os = h.getOutputStream();
+                          os.write(bs);
+                          os.close();
+                      }
+                      int code = h.getResponseCode();
+                      InputStream in = code >= 400 ? h.getErrorStream() : h.getInputStream();
+                      if (in == null) {
+                          if (code >= 400) throw new Exception("http " + code);
+                          return "";
+                      }
+                      ByteArrayOutputStream bo = new ByteArrayOutputStream();
+                      byte[] buf = new byte[4096];
+                      int n;
+                      while ((n = in.read(buf)) > 0) bo.write(buf, 0, n);
+                      in.close();
+                      if (code >= 400) throw new Exception("http " + code);
+                      return bo.toString("UTF-8");
+                  } finally {
+                      h.disconnect();
+                  }
+              }
+          }
+          EOF
+          cat > $P/CallActionReceiver.java <<'EOF'
+          package com.opferchat.app;
+
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+
+          import com.getcapacitor.JSObject;
+
+          /* Knöpfe in den Anruf-Benachrichtigungen: Ablehnen, Stumm, Lautsprecher, Kamera, Auflegen */
+          public class CallActionReceiver extends BroadcastReceiver {
+              static final String ACT = "com.opferchat.app.CALL_ACT";
+
+              @Override
+              public void onReceive(Context c, Intent in) {
+                  if (in == null) return;
+                  String a = in.getAction();
+                  if (IncomingCall.ACT_DECLINE.equals(a)) {
+                      final String gid = in.getStringExtra("gid");
+                      final long ts = in.getLongExtra("ts", 0L);
+                      IncomingCall.cancel(c, null);
+                      JSObject o = new JSObject();
+                      o.put("a", "decline");
+                      o.put("gid", gid != null ? gid : "");
+                      OcNativePlugin.emit("callAction", o);
+                      final PendingResult pr = goAsync();
+                      final Context ac = c.getApplicationContext();
+                      new Thread(new Runnable() {
+                          @Override
+                          public void run() {
+                              try {
+                                  IncomingCall.declineRest(ac, gid, ts);
+                              } finally {
+                                  try {
+                                      pr.finish();
+                                  } catch (Exception e) {
+                                      /* egal */
+                                  }
+                              }
+                          }
+                      }).start();
+                      return;
+                  }
+                  if (ACT.equals(a)) {
+                      String what = in.getStringExtra("a");
+                      if (what == null) return;
+                      if (OcNativePlugin.inst == null) {
+                          /* Seite läuft nicht mehr: dann wenigstens die Anzeige beenden */
+                          if ("hang".equals(what)) {
+                              OcNativePlugin.callActive = false;
+                              try {
+                                  c.stopService(new Intent(c, CallService.class));
+                              } catch (Exception e) {
+                                  /* egal */
+                              }
+                          }
+                          return;
+                      }
+                      JSObject o = new JSObject();
+                      o.put("a", what);
+                      OcNativePlugin.emit("callAction", o);
+                  }
+              }
+          }
+          EOF
+          cat > $P/OcMessagingService.java <<'EOF'
+          package com.opferchat.app;
+
+          import com.google.firebase.messaging.RemoteMessage;
+
+          import java.util.Map;
+
+          /* Empfängt Push-Nachrichten. Anrufe zeigt die App selbst als Vollbild an, alles andere geht wie bisher an Capacitor. */
+          public class OcMessagingService extends com.capacitorjs.plugins.pushnotifications.MessagingService {
+              @Override
+              public void onMessageReceived(RemoteMessage msg) {
+                  try {
+                      Map<String, String> d = msg.getData();
+                      String t = d != null ? d.get("type") : null;
+                      if ("call".equals(t)) {
+                          IncomingCall.onPush(this, d);
+                          return;
+                      }
+                      if ("callend".equals(t)) {
+                          IncomingCall.cancel(this, d.get("gid"));
+                          return;
+                      }
+                  } catch (Exception e) {
+                      /* dann wie bisher */
+                  }
+                  super.onMessageReceived(msg);
+              }
+          }
+          EOF
           cat > $P/MainActivity.java <<'EOF'
           package com.opferchat.app;
 
+          import android.app.Activity;
+          import android.app.KeyguardManager;
+          import android.content.Context;
           import android.content.Intent;
+          import android.os.Build;
           import android.os.Bundle;
+          import android.view.WindowManager;
           import android.webkit.WebView;
 
           import com.getcapacitor.BridgeActivity;
+          import com.getcapacitor.JSObject;
 
           public class MainActivity extends BridgeActivity {
+              /* Ist die App gerade vorne? Dann klingelt die Webseite selbst. */
+              static volatile boolean fg = false;
+
               @Override
               public void onCreate(Bundle savedInstanceState) {
                   registerPlugin(OcNativePlugin.class);
                   super.onCreate(savedInstanceState);
                   fixTextZoom();
-                  if (savedInstanceState == null) OcNativePlugin.handleIntent(getIntent());
+                  if (savedInstanceState == null) {
+                      OcNativePlugin.handleIntent(getIntent());
+                      handleCall(getIntent());
+                  }
               }
 
               /* Feste Groesse: Die Schriftgroesse des Handys soll die App nicht zusammenquetschen oder auseinanderziehen.
@@ -451,18 +1176,22 @@ jobs:
               @Override
               public void onResume() {
                   super.onResume();
+                  fg = true;
                   fixTextZoom();
+                  IncomingCall.resumeCheck(this);
               }
 
               @Override
               protected void onNewIntent(Intent intent) {
                   super.onNewIntent(intent);
                   OcNativePlugin.handleIntent(intent);
+                  handleCall(intent);
               }
 
               @Override
               public void onPause() {
                   super.onPause();
+                  fg = false;
                   /* Waehrend eines Anrufs soll die Seite im Hintergrund weiterlaufen. */
                   if (OcNativePlugin.callActive) {
                       try {
@@ -474,18 +1203,78 @@ jobs:
                       }
                   }
               }
+
+              @Override
+              public void onStop() {
+                  super.onStop();
+                  /* Ohne Anruf nie über dem Sperrbildschirm bleiben */
+                  if (!OcNativePlugin.callActive && !IncomingCall.isActive()) lockMode(this, false);
+              }
+
+              /* Geöffnet über die Anruf-Benachrichtigung: Klingeln (Vollbild), Annehmen, Nachricht oder laufender Anruf */
+              private void handleCall(Intent in) {
+                  try {
+                      if (in == null || !IncomingCall.ACT_OPEN.equals(in.getAction())) return;
+                      String gid = in.getStringExtra("gid");
+                      String act = in.getStringExtra("act");
+                      if (gid == null) return;
+                      if (act == null) act = "ring";
+                      if (!"open".equals(act)) lockMode(this, true);
+                      if ("accept".equals(act) || "msg".equals(act)) IncomingCall.cancel(this, null);
+                      JSObject o = new JSObject();
+                      o.put("gid", gid);
+                      o.put("act", act);
+                      String n = in.getStringExtra("n");
+                      String by = in.getStringExtra("by");
+                      o.put("n", n != null ? n : "");
+                      o.put("by", by != null ? by : "");
+                      o.put("v", in.getBooleanExtra("v", false));
+                      o.put("ts", in.getLongExtra("ts", 0L));
+                      o.put("locked", isLocked(this));
+                      OcNativePlugin.setLaunch(o);
+                      in.setAction(null);
+                  } catch (Exception e) {
+                      /* egal */
+                  }
+              }
+
+              @SuppressWarnings("deprecation")
+              static void lockMode(Activity a, boolean on) {
+                  try {
+                      if (Build.VERSION.SDK_INT >= 27) {
+                          a.setShowWhenLocked(on);
+                          a.setTurnScreenOn(on);
+                      } else {
+                          int f = WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED | WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON;
+                          if (on) a.getWindow().addFlags(f);
+                          else a.getWindow().clearFlags(f);
+                      }
+                  } catch (Exception e) {
+                      /* egal */
+                  }
+              }
+
+              static boolean isLocked(Context c) {
+                  try {
+                      KeyguardManager km = (KeyguardManager) c.getSystemService(Context.KEYGUARD_SERVICE);
+                      return km != null && km.isKeyguardLocked();
+                  } catch (Exception e) {
+                      return false;
+                  }
+              }
           }
           EOF
           cat > patch_manifest.py <<'EOF'
-          # Traegt Rechte, Dienst und Links in die AndroidManifest.xml ein. Aufruf: python3 patch_manifest.py <Pfad> <1=mit eigenen Teilen | 0=ohne>
+          # Traegt Rechte, Dienst und Links in die AndroidManifest.xml ein. Aufruf: python3 patch_manifest.py <Pfad> <1=mit eigenen Teilen | 0=ohne> [1=mit eigenem Push-Dienst fuer Anrufe | 0=ohne]
           import sys, xml.dom.minidom
           path, custom = sys.argv[1], sys.argv[2] == '1'
+          msgsvc = custom and (len(sys.argv) < 4 or sys.argv[3] == '1')
           s = open(path, encoding='utf8').read()
           PERMS = ['ACCESS_NETWORK_STATE', 'CAMERA', 'RECORD_AUDIO', 'MODIFY_AUDIO_SETTINGS', 'ACCESS_FINE_LOCATION', 'ACCESS_COARSE_LOCATION',
                    'POST_NOTIFICATIONS', 'VIBRATE', 'WAKE_LOCK', 'RECEIVE_BOOT_COMPLETED', 'SCHEDULE_EXACT_ALARM', 'USE_FULL_SCREEN_INTENT',
                    'BLUETOOTH_CONNECT', 'READ_MEDIA_IMAGES', 'READ_MEDIA_VIDEO', 'USE_BIOMETRIC', 'REQUEST_IGNORE_BATTERY_OPTIMIZATIONS']
           if custom:
-              PERMS += ['FOREGROUND_SERVICE', 'FOREGROUND_SERVICE_MICROPHONE', 'FOREGROUND_SERVICE_CAMERA']
+              PERMS += ['FOREGROUND_SERVICE', 'FOREGROUND_SERVICE_MICROPHONE', 'FOREGROUND_SERVICE_CAMERA', 'POST_PROMOTED_NOTIFICATIONS']
           FEATS = ['android.hardware.camera', 'android.hardware.camera.autofocus', 'android.hardware.microphone', 'android.hardware.location',
                    'android.hardware.bluetooth', 'android.hardware.fingerprint']
           add = ''
@@ -504,6 +1293,22 @@ jobs:
                   svc = '        <service android:name=".CallService" android:exported="false" android:foregroundServiceType="microphone|camera" />\n'
                   i = s.rindex('</application>')
                   s = s[:i] + svc + s[i:]
+              if 'CallActionReceiver' not in s:
+                  rcv = '        <receiver android:name=".CallActionReceiver" android:exported="false" />\n'
+                  i = s.rindex('</application>')
+                  s = s[:i] + rcv + s[i:]
+              if msgsvc and 'OcMessagingService' not in s:
+                  # Eigener Push-Dienst: Anrufe als Vollbild, alles andere wie bisher. Der von Capacitor fliegt raus, sonst bekommt der die Nachrichten.
+                  if 'xmlns:tools=' not in s:
+                      s = s.replace('<manifest ', '<manifest xmlns:tools="http://schemas.android.com/tools" ', 1)
+                  ms = ('        <service android:name=".OcMessagingService" android:exported="false">\n'
+                        '            <intent-filter android:priority="10">\n'
+                        '                <action android:name="com.google.firebase.MESSAGING_EVENT" />\n'
+                        '            </intent-filter>\n'
+                        '        </service>\n'
+                        '        <service android:name="com.capacitorjs.plugins.pushnotifications.MessagingService" tools:node="remove" />\n')
+                  i = s.rindex('</application>')
+                  s = s[:i] + ms + s[i:]
               if 'android:scheme="opferchat"' not in s:
                   flt = '''            <intent-filter android:autoVerify="true">
                           <action android:name="android.intent.action.VIEW" />
@@ -532,7 +1337,7 @@ jobs:
                   s = s[:i] + flt + '        ' + s[i:]
           xml.dom.minidom.parseString(s.encode('utf8'))  # muss gueltiges XML sein, sonst Abbruch
           open(path, 'w', encoding='utf8').write(s)
-          print('Manifest ok, custom=%s' % custom)
+          print('Manifest ok, custom=%s, push=%s' % (custom, msgsvc))
           EOF
           R=android/app/src/main/res
           mkdir -p $R/raw
@@ -833,9 +1638,13 @@ jobs:
               s=re.sub(r'^android \{', 'android {\n    lint {\n        checkReleaseBuilds false\n        abortOnError false\n    }', s, count=1, flags=re.M)
           if 'useLegacyPackaging' not in s:
               s=re.sub(r'^android \{', 'android {\n    packaging {\n        jniLibs {\n            useLegacyPackaging = true\n        }\n    }', s, count=1, flags=re.M)
+          # Fuer den eigenen Push-Dienst (Anrufe als Vollbild) braucht der App-Teil Firebase Messaging selbst
+          if 'firebase-messaging' not in s:
+              s=re.sub(r'^dependencies \{', 'dependencies {\n    implementation "com.google.firebase:firebase-messaging:24.1.0" // oc-push', s, count=1, flags=re.M)
           open(p,'w',encoding='utf8').write(s)
           PY
           grep -n "lint" -A3 android/app/build.gradle | head
+          grep -n "firebase-messaging" android/app/build.gradle || echo "::warning::firebase-messaging nicht eingetragen"
       - name: App-Symbol und Startbild
         run: |
           command -v convert || (sudo apt-get update && sudo apt-get install -y imagemagick)
@@ -883,6 +1692,15 @@ jobs:
           LEVEL=""
           if build; then LEVEL="voll"; fi
           if [ -z "$LEVEL" ]; then
+            echo "::warning::Bauen mit allem hat nicht geklappt. Nächster Versuch ohne den eigenen Push-Dienst für Anrufe."
+            P=app/src/main/java/com/opferchat/app
+            rm -f $P/OcMessagingService.java
+            sed -i '/oc-push/d' app/build.gradle
+            cp app/src/main/AndroidManifest.xml.base app/src/main/AndroidManifest.xml
+            python3 ../patch_manifest.py app/src/main/AndroidManifest.xml 1 0
+            if build; then LEVEL="ohne Vollbild-Anruf bei geschlossener App"; fi
+          fi
+          if [ -z "$LEVEL" ]; then
             echo "::warning::Bauen mit allen Zusatzfunktionen hat nicht geklappt. Nächster Versuch ohne die Community-Plugins."
             drop ../opt_community_ok.txt; : > ../opt_community_ok.txt
             if build; then LEVEL="ohne Community-Plugins"; fi
@@ -895,7 +1713,7 @@ jobs:
           if [ -z "$LEVEL" ]; then
             echo "::warning::Letzter Versuch ohne die eigenen Android-Teile."
             P=app/src/main/java/com/opferchat/app
-            cp ../MainActivity.java.orig $P/MainActivity.java; rm -f $P/OcNativePlugin.java $P/CallService.java
+            cp ../MainActivity.java.orig $P/MainActivity.java; rm -f $P/OcNativePlugin.java $P/CallService.java $P/IncomingCall.java $P/CallActionReceiver.java $P/OcMessagingService.java; sed -i '/oc-push/d' app/build.gradle
             cp app/src/main/AndroidManifest.xml.base app/src/main/AndroidManifest.xml
             python3 ../patch_manifest.py app/src/main/AndroidManifest.xml 0
             if build; then LEVEL="Basis"; fi
@@ -932,7 +1750,7 @@ jobs:
           L=$(cat ../opt_official_ok.txt ../opt_community_ok.txt | grep -vx '@capacitor-mlkit/barcode-scanning' || true)
           (cd .. && for n in $L; do npm uninstall --no-audit --no-fund "$n" || true; done && npx cap sync android)
           P=app/src/main/java/com/opferchat/app
-          cp ../MainActivity.java.orig $P/MainActivity.java; rm -f $P/OcNativePlugin.java $P/CallService.java
+          cp ../MainActivity.java.orig $P/MainActivity.java; rm -f $P/OcNativePlugin.java $P/CallService.java $P/IncomingCall.java $P/CallActionReceiver.java $P/OcMessagingService.java; sed -i '/oc-push/d' app/build.gradle
           cp app/src/main/AndroidManifest.xml.base app/src/main/AndroidManifest.xml
           python3 ../patch_manifest.py app/src/main/AndroidManifest.xml 0
           ./gradlew assembleRelease --no-daemon && sign Opferchat-Basis.apk || echo "::warning::Basis-Testversion ließ sich nicht bauen"
